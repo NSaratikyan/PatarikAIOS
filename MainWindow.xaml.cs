@@ -21,6 +21,7 @@ public partial class MainWindow : Window
     private readonly EmployeeTelegramBotSettingsStore _employeeTelegramBotSettingsStore = new();
     private readonly EmployeeBotUserStore _employeeBotUserStore = new();
     private readonly EmployeeSupplierActionStore _employeeSupplierActionStore = new();
+    private readonly SupplierStatusChangeStore _supplierStatusChangeStore = new();
     private readonly EmployeePendingIssueStore _employeePendingIssueStore = new();
     private readonly PendingEmployeeOrderChangeStore _pendingEmployeeOrderChangeStore = new();
     private readonly EmployeeTaskStore _employeeTaskStore = new();
@@ -480,6 +481,18 @@ public partial class MainWindow : Window
         }
         var lines = history.Select(x => $"{x.Date:dd.MM.yyyy} · {x.Status} · {(string.IsNullOrWhiteSpace(x.Description) ? "Առանց նկարագրության" : x.Description)}");
         MessageBox.Show($"{supplier}\n\nԽնդիրների վերջին պատմությունը՝\n{string.Join("\n", lines)}", "Մատակարարի խնդիրների պատմություն", MessageBoxButton.OK, MessageBoxImage.Warning);
+    }
+
+    private async void EditSupplierStatus(SupplierWeekPlanRow row, EmployeeSupplierAction? currentAction)
+    {
+        var previousStatus = currentAction?.Status ?? "Սպասվում է";
+        var window = new SupplierStatusWindow(row.Date, row.Supplier, previousStatus) { Owner = this };
+        if (window.ShowDialog() != true || window.Result is null) return;
+
+        var history = _supplierStatusChangeStore.Load();
+        history.Add(window.Result);
+        _supplierStatusChangeStore.Save(history);
+        await LoadAsync("Suppliers");
     }
 
     private async Task ProcessEmployeeTelegramMessagesAsync()
@@ -1359,7 +1372,7 @@ public partial class MainWindow : Window
         PageHost.Content = page switch
         {
             "Finance" => Views.Finance(_snapshot),
-            "Suppliers" => Views.Suppliers(PlanForSelectedDate(), _snapshot.Suppliers, _partnerDebts, _employeeSupplierActionStore.Load(), SaveSupplierWeekRow, ShowSupplierEmployeeStatus),
+            "Suppliers" => Views.Suppliers(PlanForSelectedDate(), _snapshot.Suppliers, _partnerDebts, _employeeSupplierActionStore.Load(), _supplierStatusChangeStore.Load(), SaveSupplierWeekRow, ShowSupplierEmployeeStatus, EditSupplierStatus),
             "PurchasePlan" => await PurchasePlanViewAsync(),
             "SupplierSales" => await SupplierSalesViewAsync(),
             "Payments" => Views.Payments(_snapshot, _completedPayments, _requiredPayments, PlanForSelectedDate(), _employeeSupplierActionStore.Load(), EditRequiredPayment, DeleteRequiredPayment),
@@ -1755,9 +1768,17 @@ public partial class MainWindow : Window
     private async void AddRequiredPayment_Click(object sender, RoutedEventArgs e)
     {
         var window = new RequiredPaymentWindow(_selectedDate) { Owner = this };
-        if (window.ShowDialog() != true || window.Result is null) return;
-        _requiredPayments.Add(window.Result);
-        _requiredPaymentStore.Save(_requiredPayments);
+        window.PaymentSavedAndNew += payment =>
+        {
+            _requiredPayments.Add(payment);
+            _requiredPaymentStore.Save(_requiredPayments);
+        };
+        var accepted = window.ShowDialog() == true && window.Result is not null;
+        if (accepted)
+        {
+            _requiredPayments.Add(window.Result!);
+            _requiredPaymentStore.Save(_requiredPayments);
+        }
         await LoadAsync("Payments");
     }
 

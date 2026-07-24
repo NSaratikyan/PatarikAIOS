@@ -143,7 +143,7 @@ public static class Views
         return new ScrollViewer { Content = root, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Auto };
     }
 
-    public static UIElement Suppliers(IReadOnlyList<SupplierWeekPlanRow> rows, IReadOnlyList<Supplier> supplierDebts, IReadOnlyList<PartnerDebt> importedDebts, IReadOnlyList<EmployeeSupplierAction> employeeActions, Action<SupplierWeekPlanRow, decimal, decimal, decimal, decimal> saveRow, Action<string> showSupplierStatus)
+    public static UIElement Suppliers(IReadOnlyList<SupplierWeekPlanRow> rows, IReadOnlyList<Supplier> supplierDebts, IReadOnlyList<PartnerDebt> importedDebts, IReadOnlyList<EmployeeSupplierAction> employeeActions, IReadOnlyList<SupplierStatusChange> statusChanges, Action<SupplierWeekPlanRow, decimal, decimal, decimal, decimal> saveRow, Action<string> showSupplierStatus, Action<SupplierWeekPlanRow, EmployeeSupplierAction?> editStatus)
     {
         var root = new StackPanel();
         root.Children.Add(Text("Մատակարարների շաբաթական գրաֆիկ", 19, FontWeights.SemiBold));
@@ -158,7 +158,17 @@ public static class Views
                     .Where(x => x.Date == row.Date && SupplierNamesMatch(x.Supplier, row.Supplier))
                     .OrderByDescending(x => x.ReportedAt)
                     .FirstOrDefault();
-                AddEditableSupplierWeekRow(grid, ApplyKnownDebt(row, supplierDebts, importedDebts), currentAction, saveRow, showSupplierStatus);
+                var manualChange = statusChanges
+                    .Where(x => x.Date == row.Date && SupplierNamesMatch(x.Supplier, row.Supplier))
+                    .OrderByDescending(x => x.ChangedAt)
+                    .FirstOrDefault();
+                if (manualChange is not null)
+                {
+                    var explanation = $"Ձեռքով փոփոխվել է {manualChange.ChangedAt:dd.MM.yyyy HH:mm}-ին։ Նախորդ կարգավիճակ՝ {manualChange.PreviousStatus}.";
+                    if (!string.IsNullOrWhiteSpace(manualChange.Note)) explanation += $" Նշում՝ {manualChange.Note}";
+                    currentAction = new EmployeeSupplierAction(row.Date, row.Supplier, manualChange.NewStatus, explanation, "owner", manualChange.ChangedBy, manualChange.ChangedAt);
+                }
+                AddEditableSupplierWeekRow(grid, ApplyKnownDebt(row, supplierDebts, importedDebts), currentAction, saveRow, showSupplierStatus, editStatus);
             }
             var orderCount = day.Count(x => x.OrderAmount > 0);
             var orderSum = day.Sum(x => x.OrderAmount);
@@ -179,6 +189,7 @@ public static class Views
     {
         var isPast = s.Date < DateOnly.FromDateTime(DateTime.Today);
         var root = new StackPanel(); root.Children.Add(Text("Վճարումների պլան", 19, FontWeights.SemiBold));
+        root.Children.Add(Text($"Ընտրված ամսաթիվ՝ {s.Date:dd.MM.yyyy}. Ստորև ցուցադրված են միայն այդ օրվա պլանավորված և փաստացի վճարումները։", 13, null, BrushFor("#64748B")));
         var supplierNames = supplierRows.Select(x => x.Supplier).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var completedForDate = completedPayments.Where(x => x.PaidDate == s.Date).ToList();
         var supplierCompleted = SupplierActualPaymentRows(s.Date, supplierRows, completedForDate, employeeSupplierActions);
@@ -204,7 +215,17 @@ public static class Views
         var requiredGrid = NewGrid("Կատեգորիա", "Անվանում / ստացող", "Գումար", "Վճարման օր", "Կրկնում", "Նշում", "");
         foreach (var item in requiredPayments.Where(x => !isPast && x.IsActive && RequiredPaymentRules.AppliesOn(x, s.Date)).OrderBy(x => x.PaymentDay))
             AddRequiredPaymentRow(requiredGrid, item, editPayment, deletePayment);
+        if (requiredPayments.All(x => !x.IsActive || !RequiredPaymentRules.AppliesOn(x, s.Date)))
+            AddRow(requiredGrid, "—", "Այս օրվա համար պարտադիր վճարում չկա", "", "", "", "", "");
         root.Children.Add(Card(requiredGrid));
+
+        root.Children.Add(Text("Ընտրված ամսվա պարտադիր վճարումների բազա", 16, FontWeights.SemiBold, BrushFor("#0F766E")));
+        root.Children.Add(Text("Այստեղից կարող եք խմբագրել կամ հեռացնել ցանկացած վճարում՝ առանց այլ օր ընտրելու։", 12, null, BrushFor("#64748B")));
+        var monthlyGrid = NewGrid("Կատեգորիա", "Անվանում / ստացող", "Գումար", "Վճարման օր", "Կրկնում", "Նշում", "");
+        var monthItems = requiredPayments.Where(x => RequiredPaymentRules.AppliesInMonth(x, s.Date)).OrderBy(x => x.PaymentDay).ThenBy(x => x.Name).ToList();
+        foreach (var item in monthItems) AddRequiredPaymentRow(monthlyGrid, item, editPayment, deletePayment);
+        if (!monthItems.Any()) AddRow(monthlyGrid, "—", "Բազայում վճարում չկա", "", "", "", "", "");
+        root.Children.Add(Card(monthlyGrid));
 
         root.Children.Add(Text("Ամսական վճարումների գրաֆիկ", 16, FontWeights.SemiBold, BrushFor("#0F766E")));
         var scheduleGrid = NewGrid("Վճարման օր", "Վճարումներ", "Ընդհանուր գումար");
@@ -611,7 +632,7 @@ public static class Views
         };
         return new StackPanel { Orientation = Orientation.Horizontal, Children = { box, button } };
     }
-    private static void AddEditableSupplierWeekRow(Grid grid, SupplierWeekPlanRow row, EmployeeSupplierAction? employeeAction, Action<SupplierWeekPlanRow, decimal, decimal, decimal, decimal> saveRow, Action<string> showSupplierStatus)
+    private static void AddEditableSupplierWeekRow(Grid grid, SupplierWeekPlanRow row, EmployeeSupplierAction? employeeAction, Action<SupplierWeekPlanRow, decimal, decimal, decimal, decimal> saveRow, Action<string> showSupplierStatus, Action<SupplierWeekPlanRow, EmployeeSupplierAction?> editStatus)
     {
         var gridRow = grid.RowDefinitions.Count; grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         var order = MoneyInput(row.OrderAmount); var payment = MoneyInput(row.PaymentAmount); var oldDebt = MoneyInput(row.OldDebtPayment); var debt = MoneyInput(row.Debt);
@@ -625,7 +646,12 @@ public static class Views
         var supplierButton = new Button { Content = row.Supplier, HorizontalAlignment = HorizontalAlignment.Left, Padding = new Thickness(0), BorderThickness = new Thickness(0), Background = Brushes.Transparent, Foreground = BrushFor("#0F766E"), Cursor = System.Windows.Input.Cursors.Hand };
         supplierButton.Click += (_, _) => showSupplierStatus(row.Supplier);
         var status = EmployeeStatusBadge(employeeAction);
-        var cells = new UIElement[] { supplierButton, order, payment, oldDebt, debt, Text(Signed(change), 13, null, change > 0 ? BrushFor("#B91C1C") : change < 0 ? BrushFor("#0F766E") : BrushFor("#475569")), status, save };
+        var statusText = employeeAction is null
+            ? "Սեղմեք՝ կարգավիճակը ձեռքով փոխելու համար"
+            : $"{employeeAction.Status}\n{employeeAction.Description}\nՓոփոխող՝ {employeeAction.ReportedByName}\nԺամանակ՝ {employeeAction.ReportedAt:dd.MM.yyyy HH:mm}\n\nՍեղմեք՝ կարգավիճակը ձեռքով փոխելու համար";
+        var statusButton = new Button { Content = status, ToolTip = statusText, Padding = new Thickness(0), BorderThickness = new Thickness(0), Background = Brushes.Transparent, Cursor = System.Windows.Input.Cursors.Hand };
+        statusButton.Click += (_, _) => editStatus(row, employeeAction);
+        var cells = new UIElement[] { supplierButton, order, payment, oldDebt, debt, Text(Signed(change), 13, null, change > 0 ? BrushFor("#B91C1C") : change < 0 ? BrushFor("#0F766E") : BrushFor("#475569")), statusButton, save };
         for (var i = 0; i < cells.Length; i++) { if (cells[i] is FrameworkElement element) element.Margin = new Thickness(0, 8, 5, 8); Grid.SetRow(cells[i], gridRow); Grid.SetColumn(cells[i], i); grid.Children.Add(cells[i]); }
     }
     private static UIElement EmployeeStatusBadge(EmployeeSupplierAction? action)
