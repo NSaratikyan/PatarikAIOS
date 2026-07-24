@@ -1,0 +1,47 @@
+<Window x:Class="PatarikAIOS.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Patarik AI OS" Height="780" Width="1250" MinHeight="650" MinWidth="950" Background="#F8FAFC">
+  <Grid>
+    <Grid.ColumnDefinitions><ColumnDefinition Width="220"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+    <Border Background="#0F172A" Padding="18">
+      <StackPanel>
+        <TextBlock Text="PATARIK" Foreground="White" FontSize="25" FontWeight="Bold"/>
+        <TextBlock Text="AI OS — MVP" Foreground="#94A3B8" Margin="0,0,0,30"/>
+        <Button Content="🏠  Գլխավոր" Tag="Dashboard" Click="Navigate_Click" HorizontalContentAlignment="Left"/>
+        <Button Content="💰  Ֆինանսներ" Tag="Finance" Click="Navigate_Click" HorizontalContentAlignment="Left"/>
+        <Button Content="🏢  Մատակարարներ" Tag="Suppliers" Click="Navigate_Click" HorizontalContentAlignment="Left"/>
+        <Button Content="📦  Վաղվա պատվերներ" Tag="PurchasePlan" Click="Navigate_Click" HorizontalContentAlignment="Left"/>
+        <Button Content="📅  Վճարումների պլան" Tag="Payments" Click="Navigate_Click" HorizontalContentAlignment="Left"/>
+        <Button Content="🤖  AI առաջարկներ" Tag="Recommendations" Click="Navigate_Click" HorizontalContentAlignment="Left"/>
+        <Button x:Name="CashImportButton" Content="Ներմուծել դրամարկղային ֆայլ" Click="ImportCashDocument_Click" HorizontalContentAlignment="Left" Background="#0F766E" Foreground="White" Margin="0,16,0,0"/>
+        <Button Content="📊  Ամփոփում" Tag="Summary" Click="Navigate_Click" HorizontalContentAlignment="Left"/>
+        <Button x:Name="CashAdjustmentButton" Content="✎  Դրամարկղի ուղղում" Click="AddCashDeskAdjustment_Click" HorizontalContentAlignment="Left"/>
+        <Separator Margin="0,18,0,10"/>
+        <TextBlock Text="ՀԾ ինտեգրում" Foreground="#94A3B8"/>
+        <TextBlock x:Name="DataSourceStatusText" Text="Տվյալների աղբյուր՝ Demo" Foreground="White" TextWrapping="Wrap" Margin="0,6,0,0"/>
+      </StackPanel>
+    </Border>
+    <Grid Grid.Column="1" Margin="24">
+      <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+      <DockPanel Margin="0,0,0,18">
+        <StackPanel DockPanel.Dock="Left"><TextBlock Text="Patarik AI OS" FontSize="27" FontWeight="Bold"/><TextBlock x:Name="SubtitleText" Foreground="#64748B"/></StackPanel>
+        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+          <TextBlock x:Name="DateLabel" Text="Օր" VerticalAlignment="Center" Margin="0,0,6,0" Foreground="#475569"/>
+          <DatePicker x:Name="ViewDatePicker" Width="125" SelectedDateChanged="ViewDatePicker_SelectedDateChanged" Margin="0,4,10,4"/>
+          <Button x:Name="ShowDateButton" Content="Ցույց տալ" Click="ShowSelectedDate_Click" Margin="0,4,10,4"/>
+          <Button x:Name="ApiButton" Content="⚙ ՀԾ API" Click="ConfigureHtsApi_Click" Margin="0,4,10,4"/>
+          <Button x:Name="TelegramButton" Content="✈ Telegram" Click="ConfigureTelegram_Click" Margin="0,4,10,4"/>
+          <Button x:Name="EmployeeTelegramButton" Content="👥 Աշխատակիցների բոտ" Click="ConfigureEmployeeTelegram_Click" Margin="0,4,10,4"/>
+          <Button x:Name="CompletedPaymentButton" Content="✓ Կատարված վճարում" Click="AddCompletedPayment_Click" Background="#166534" Foreground="White" Margin="0,4,10,4"/>
+          <Button x:Name="RequiredPaymentButton" Content="＋ Պարտադիր վճարում" Click="AddRequiredPayment_Click" Margin="0,4,10,4"/>
+          <Button x:Name="SupplierDayButton" Content="↔ Փոխել մատակարարի օրը" Click="ChangeSupplierWeekDay_Click" Margin="0,4,10,4"/>
+          <Button x:Name="SupplierMembershipButton" Content="+/- Կարգավորել մատակարարին" Click="EditSupplierScheduleMembership_Click" Margin="0,4,10,4"/>
+          <Button x:Name="PaymentChangeButton" Content="＋ Վճարման փոփոխություն" Click="AddPaymentChange_Click" Background="#0F766E" Foreground="White" Margin="0,4,10,4"/>
+          <Button x:Name="RefreshButton" Content="↻ Թարմացնել" Click="Refresh_Click"/>
+        </StackPanel>
+      </DockPanel>
+      <ContentControl x:Name="PageHost" Grid.Row="1"/>
+    </Grid>
+  </Grid>
+</Window>
