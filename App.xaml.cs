@@ -2,7 +2,7 @@ namespace PatarikAIOS;
 
 public partial class App : Application
 {
-    public static AppServices Services { get; } = new(new DemoDataProvider());
+    public static AppServices Services { get; } = new(new EmptyDataProvider());
     private Mutex? _automationMutex;
 
     /// <summary>

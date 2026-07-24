@@ -4,16 +4,8 @@ using System.Text.Json;
 namespace PatarikAIOS;
 
 /// <summary>Recurring fixed obligations entered by the owner (salary, rent, tax, loan, utilities, etc.).</summary>
-public sealed record RequiredPaymentTemplate(
-    Guid Id,
-    string Category,
-    string Name,
-    decimal Amount,
-    int PaymentDay,
-    string Note,
-    bool IsActive = true,
-    bool RepeatsMonthly = true,
-    DateOnly? OnlyForMonth = null);
+public sealed record RequiredPaymentTemplate(Guid Id, string Category, string Name, decimal Amount, int PaymentDay,
+    string Note, bool IsActive = true, bool RepeatsMonthly = true, DateOnly? OnlyForMonth = null);
 
 public static class RequiredPaymentRules
 {
@@ -33,18 +25,16 @@ public sealed class RequiredPaymentStore
     private readonly string _path = Path.Combine(AppContext.BaseDirectory, "data", "required-payments.json");
     private readonly JsonSerializerOptions _options = new() { WriteIndented = true };
 
+    /// <summary>Returns only owner-entered payments. No example payment is ever created.</summary>
     public List<RequiredPaymentTemplate> LoadOrSeed()
     {
         try
         {
-            if (File.Exists(_path)) return JsonSerializer.Deserialize<List<RequiredPaymentTemplate>>(File.ReadAllText(_path), _options) ?? [];
+            if (File.Exists(_path))
+                return JsonSerializer.Deserialize<List<RequiredPaymentTemplate>>(File.ReadAllText(_path), _options) ?? [];
         }
         catch (JsonException) { }
-        var initial = new List<RequiredPaymentTemplate>
-        {
-            new(Guid.NewGuid(), "Աշխատավարձ", "Աշխատավարձ", 300_000m, 25, "Նախնական գրաֆիկից")
-        };
-        Save(initial); return initial;
+        return [];
     }
 
     public void Save(IEnumerable<RequiredPaymentTemplate> items)

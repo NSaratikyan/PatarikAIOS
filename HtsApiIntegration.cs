@@ -62,22 +62,21 @@ public sealed class HtsApiDataProvider(HtsApiSettings settings) : IHtsDataProvid
         try { documentRows = await GetDocumentsAsync(client, date, date, cancellationToken); }
         catch { documentRows = []; }
         var dailyMovements = ToSupplierDailyMovements(documentRows, apiSuppliers, date);
-        var baseSnapshot = await new DemoDataProvider().GetSnapshotAsync(date, cancellationToken);
 
         return new DashboardSnapshot
         {
             Date = date,
-            Cash = baseSnapshot.Cash,
+            Cash = new CashPosition(0m, 0m),
             Suppliers = apiSuppliers,
             SupplierMovements = dailyMovements,
             // Payments are built from HTS documents, supplier plans and the
             // owner's required-payment database. Demo payments must never
             // appear while the live HTS connection is active.
             Payments = [],
-            Forecast = baseSnapshot.Forecast,
+            Forecast = [],
             Sales = todaySales,
-            Recommendations = baseSnapshot.Recommendations,
-            Tasks = baseSnapshot.Tasks
+            Recommendations = [],
+            Tasks = []
         };
     }
 

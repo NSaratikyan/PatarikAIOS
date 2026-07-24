@@ -98,8 +98,8 @@ public partial class MainWindow : Window
         }
         else
         {
-            App.Services.UseDataProvider(new DemoDataProvider());
-            DataSourceStatusText.Text = "Տվյալների աղբյուր՝ Demo";
+            App.Services.UseDataProvider(new EmptyDataProvider());
+            DataSourceStatusText.Text = "Տվյալների աղբյուր՝ ՀԾ API-ն դեռ միացված չէ";
         }
     }
 
@@ -1372,8 +1372,8 @@ public partial class MainWindow : Window
         {
             // An unavailable report or missing API permission must never close the desktop app.
             // Keep the user working and make the cause visible instead.
-            App.Services.UseDataProvider(new DemoDataProvider());
-            DataSourceStatusText.Text = "Տվյալների աղբյուր՝ Demo (ՀԾ հարցման խնդիր)";
+            App.Services.UseDataProvider(new EmptyDataProvider());
+            DataSourceStatusText.Text = "Տվյալների աղբյուր՝ ՀԾ հարցման խնդիր. ցուցադրվում են միայն պահպանված փաստացի տվյալները";
             _snapshot = await App.Services.DataProvider.GetSnapshotAsync(_selectedDate);
             MessageBox.Show(
                 $"ՀԾ-ից ընտրված օրվա տվյալները չհաջողվեց բեռնել։\n\n{exception.Message}\n\nԾրագիրը բաց է մնացել փորձնական տվյալներով։ Ստուգեք ՀԾ API-ի հաշվետվությունների իրավասությունները, ապա սեղմեք «⚙ ՀԾ API» և նորից պահպանեք կարգավորումը։",
