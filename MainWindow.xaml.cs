@@ -636,6 +636,8 @@ public partial class MainWindow : Window
                 var command = message.Text.Trim().ToLowerInvariant();
                 if (command is "սկսել" or "/սկսել" or "/start")
                     await SendTelegramDraftAsync(settings);
+                else if (command.StartsWith("առաջարկ", StringComparison.OrdinalIgnoreCase) || command.StartsWith("/առաջարկ", StringComparison.OrdinalIgnoreCase))
+                    await SendTelegramDraftAsync(settings, TryTelegramDate(message.Text, out var proposalDate) ? proposalDate : DateOnly.FromDateTime(DateTime.Today).AddDays(2));
                 else if (command.StartsWith("գլխավոր", StringComparison.OrdinalIgnoreCase) || command.StartsWith("/գլխավոր", StringComparison.OrdinalIgnoreCase))
                     await SendTelegramDashboardAsync(settings, TryTelegramDate(message.Text, out var dashboardDate) ? dashboardDate : DateOnly.FromDateTime(DateTime.Today));
                 else if (command.StartsWith("առավոտ", StringComparison.OrdinalIgnoreCase) || command.StartsWith("/առավոտ", StringComparison.OrdinalIgnoreCase))
@@ -1032,6 +1034,7 @@ public partial class MainWindow : Window
         var otherPayments = _requiredPayments.Where(x => RequiredPaymentRules.AppliesOn(x, deliveryDate)).Sum(x => x.Amount) +
             _manualPaymentChanges.Where(x => x.PlannedDate == deliveryDate).Sum(x => x.Amount);
         var message = new System.Text.StringBuilder();
+        message.AppendLine("🤖 AI առաջարկվող պատվերներ՝ վաճառք + պաշար + հաջորդ մատակարարման օր հաշվարկով");
         message.AppendLine($"📋 Նախնական պլան — {deliveryDate:dd.MM.yyyy}");
         message.AppendLine($"Մատակարարներ՝ {supplierNames.Count}");
         var supplierOrderAmounts = supplierNames.Select(name => new
@@ -1045,7 +1048,7 @@ public partial class MainWindow : Window
         }).ToList();
         message.AppendLine();
         message.AppendLine("```");
-        message.AppendLine("Մատակարար      | Պատվ.  | Վճար.  | Հին");
+        message.AppendLine("Մատակարար      | Առաջարկ | Վճար.  | Հին");
         message.AppendLine("----------------|---------|---------|--------");
         foreach (var supplier in supplierOrderAmounts.OrderBy(x => x.Supplier))
         {
