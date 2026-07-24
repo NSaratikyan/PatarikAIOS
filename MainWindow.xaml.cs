@@ -644,6 +644,8 @@ public partial class MainWindow : Window
                     await SendTelegramMorningBriefAsync(settings, TryTelegramDate(message.Text, out var morningDate) ? morningDate : DateOnly.FromDateTime(DateTime.Today));
                 else if (command.StartsWith("վճարումներ", StringComparison.OrdinalIgnoreCase) || command.StartsWith("/վճարումներ", StringComparison.OrdinalIgnoreCase))
                     await SendTelegramPaymentsAsync(settings, TryTelegramDate(message.Text, out var paymentsDate) ? paymentsDate : DateOnly.FromDateTime(DateTime.Today));
+                else if (command.StartsWith("կարծիք", StringComparison.OrdinalIgnoreCase) || command.StartsWith("/կարծիք", StringComparison.OrdinalIgnoreCase))
+                    await SendTelegramCashFlowOpinionAsync(settings, TryTelegramDate(message.Text, out var opinionDate) ? opinionDate : DateOnly.FromDateTime(DateTime.Today));
                 else if (command.StartsWith("հաստատումներ", StringComparison.OrdinalIgnoreCase) || command.StartsWith("/հաստատումներ", StringComparison.OrdinalIgnoreCase))
                     await SendPendingConfirmationsAsync(settings);
                 else if (command.StartsWith("առաջադրանք", StringComparison.OrdinalIgnoreCase) || command.StartsWith("/առաջադրանք", StringComparison.OrdinalIgnoreCase))
@@ -865,6 +867,11 @@ public partial class MainWindow : Window
                 await SendTelegramDashboardAsync(settings, today);
                 settings = settings with { LastEveningDashboardDate = today };
             }
+            if (settings.LastCashFlowOpinionDate != today && now >= new TimeSpan(23, 40, 0))
+            {
+                await SendTelegramCashFlowOpinionAsync(settings, today);
+                settings = settings with { LastCashFlowOpinionDate = today };
+            }
             if (settings.LastEveningOperationsDate != today && now >= new TimeSpan(21, 0, 0))
             {
                 await SendEveningOperationsAsync(settings, today);
@@ -881,7 +888,8 @@ public partial class MainWindow : Window
                 LastMorningBriefDate = settings.LastMorningBriefDate,
                 LastEveningDashboardDate = settings.LastEveningDashboardDate,
                 LastEveningOperationsDate = settings.LastEveningOperationsDate,
-                LastDeliveryConfirmationDate = settings.LastDeliveryConfirmationDate
+                LastDeliveryConfirmationDate = settings.LastDeliveryConfirmationDate,
+                LastCashFlowOpinionDate = settings.LastCashFlowOpinionDate
             });
         }
         catch
@@ -941,6 +949,81 @@ public partial class MainWindow : Window
             new[] { new TelegramInlineButton("💳 Վճարումներ", $"payments:{dateCode}") }
         };
         await TelegramBotClient.SendMessageAsync(settings, message.ToString(), buttons);
+    }
+
+    private async Task SendTelegramCashFlowOpinionAsync(TelegramBotSettings settings, DateOnly startDate)
+    {
+        var snapshot = await TelegramSnapshotAsync(startDate);
+        var funds = _lastFunds ?? FundsForOpening(snapshot.Cash);
+        var historicalSales = 0m;
+        var hasHistory = false;
+        if (App.Services.DataProvider is IBusinessSummaryProvider provider)
+        {
+            try
+            {
+                var history = await provider.GetBusinessSummaryAsync(startDate.AddDays(-7), startDate.AddDays(-1));
+                historicalSales = history.Sales.SalesAmount / 7m;
+                hasHistory = history.Sales.SalesAmount > 0m;
+            }
+            catch { /* The message will explicitly say that a reliable sales forecast is unavailable. */ }
+        }
+
+        decimal MandatoryPayments(DateOnly day) =>
+            _requiredPayments.Where(x => RequiredPaymentRules.AppliesOn(x, day)).Sum(x => x.Amount)
+            + _manualPaymentChanges.Where(x => x.PlannedDate == day).Sum(x => x.Amount)
+            + snapshot.Payments.Where(x => x.DueDate == day && x.IsMandatory).Sum(x => x.Amount);
+
+        var actualToday = startDate == DateOnly.FromDateTime(DateTime.Today) ? snapshot.Sales.SalesAmount : (decimal?)null;
+        var analysis = CashFlowPlanner.Build(startDate, funds.Total, historicalSales, hasHistory, actualToday,
+            day => PlannedSuppliersFor(day), MandatoryPayments);
+
+        var text = new System.Text.StringBuilder();
+        text.AppendLine($"💬 Դրամական հոսքի կարծիք — {startDate:dd.MM.yyyy}–{startDate.AddDays(6):dd.MM.yyyy}");
+        text.AppendLine($"Մեկնարկային հասանելի միջոցներ՝ {analysis.OpeningBalance:N0} ֏");
+        if (hasHistory)
+            text.AppendLine($"Վաճառքի կանխատեսման հիմք՝ նախորդ 7 օրվա միջին՝ {analysis.HistoricalDailySales:N0} ֏ / օր");
+        else
+            text.AppendLine("⚠ Վաճառքի 7-օրյա փաստացի պատմությունը բավարար չէ։ Կանխատեսվող վաճառքը 0 է ցուցադրված, ոչ թե ենթադրված թիվ։");
+        text.AppendLine();
+        text.AppendLine($"Շաբաթվա կանխատեսվող վաճառք՝ {analysis.WeekExpectedSales:N0} ֏");
+        text.AppendLine($"Շաբաթվա մատակարարների վճարումներ՝ {analysis.WeekSupplierPayments:N0} ֏");
+        text.AppendLine($"Շաբաթվա պարտադիր/այլ վճարումներ՝ {analysis.WeekMandatoryPayments:N0} ֏");
+        text.AppendLine($"Պլանային պատվերներ՝ {analysis.WeekOrders:N0} ֏ (սա պարտքի/պաշարի ցուցանիշ է, ոչ թե ամբողջությամբ կանխիկ ելք)");
+        text.AppendLine($"Շաբաթվա կանխատեսվող վերջի մնացորդ՝ {analysis.WeekClosingBalance:N0} ֏");
+
+        foreach (var day in analysis.Days)
+            text.AppendLine($"• {day.Date:dd.MM}: վաճառք {day.ExpectedSales:N0} ֏ | վճարումներ {day.PlannedPayments:N0} ֏ | մնացորդ {day.ClosingBalance:N0} ֏");
+
+        if (!hasHistory)
+        {
+            text.AppendLine();
+            text.AppendLine("Խորհուրդ՝ մինչև վաճառքի պատմությունը ՀԾ-ից ամբողջությամբ հասանելի լինի, խոշոր վճարումները հաստատեք ֆինանսական պատասխանատուի հետ։");
+        }
+        else if (analysis.DeficitDays.Count == 0)
+        {
+            text.AppendLine();
+            text.AppendLine("✅ Ըստ ընթացիկ պլանի շաբաթվա դրամական հոսքը հավասարակշռված է։");
+        }
+        else if (analysis.WeekClosingBalance >= 0m)
+        {
+            var firstDeficit = analysis.DeficitDays[0];
+            var flexible = PlannedSuppliersFor(firstDeficit.Date)
+                .Where(x => x.PaymentAmount + x.OldDebtPayment > 0m)
+                .OrderBy(x => snapshot.Suppliers.FirstOrDefault(s => SupplierNamesMatch(s.Name, x.Supplier))?.PriorityScore ?? 50)
+                .ToList();
+            text.AppendLine();
+            text.AppendLine($"🟡 {firstDeficit.Date:dd.MM}-ին օրվա դրամական պակասը՝ {Math.Abs(firstDeficit.ClosingBalance):N0} ֏, բայց շաբաթվա վերջում գումարը բավարար է։");
+            text.AppendLine("Առաջարկ՝ պարտադիր վճարումները չտեղափոխել։ Նախ դիտարկել միայն մատակարարների ճկուն վճարումները՝");
+            foreach (var row in flexible.Take(3))
+                text.AppendLine($"• {row.Supplier} — մինչև {row.PaymentAmount + row.OldDebtPayment:N0} ֏, միայն մատակարարի հետ համաձայնեցնելուց հետո՝ 1 օր տեղափոխել։");
+        }
+        else
+        {
+            text.AppendLine();
+            text.AppendLine($"🔴 Շաբաթվա կանխատեսվող պակասը՝ {Math.Abs(analysis.WeekClosingBalance):N0} ֏։ Միայն վճարումների տեղափոխումը բավարար չէ։");
+            text.AppendLine("Առաջարկ՝ չհաստատել ոչ պարտադիր գնումներ, մատակարարների հետ վերանայել ժամկետները և դիմել հաշվապահ/ֆինանսական մասնագետի՝ վճարումների ու վաճառքի պլանը հաստատելու համար։");
+        }
+        await TelegramBotClient.SendMessageAsync(settings, text.ToString());
     }
 
     private async Task SendTelegramMorningBriefAsync(TelegramBotSettings settings, DateOnly date)

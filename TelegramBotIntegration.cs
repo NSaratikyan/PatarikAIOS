@@ -5,7 +5,7 @@ using System.Text.Json;
 namespace PatarikAIOS;
 
 /// <summary>Local Telegram configuration. The token is kept only on this Windows account.</summary>
-public sealed record TelegramBotSettings(string BotToken, string? ChatId = null, long? LastUpdateId = null, DateOnly? EditingDate = null, DateOnly? LastMorningBriefDate = null, DateOnly? LastEveningDashboardDate = null, DateOnly? LastEveningOperationsDate = null, DateOnly? LastDeliveryConfirmationDate = null)
+public sealed record TelegramBotSettings(string BotToken, string? ChatId = null, long? LastUpdateId = null, DateOnly? EditingDate = null, DateOnly? LastMorningBriefDate = null, DateOnly? LastEveningDashboardDate = null, DateOnly? LastEveningOperationsDate = null, DateOnly? LastDeliveryConfirmationDate = null, DateOnly? LastCashFlowOpinionDate = null)
 {
     public static TelegramBotSettings Empty => new("", null);
     public bool IsConfigured => !string.IsNullOrWhiteSpace(BotToken);
