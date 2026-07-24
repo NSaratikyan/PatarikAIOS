@@ -14,6 +14,7 @@ data/
 # IDE / OS files
 .vs/
 .vscode/
+.idea/
 *.user
 *.suo
 Thumbs.db
