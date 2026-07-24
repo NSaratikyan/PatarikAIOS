@@ -35,7 +35,10 @@ public static class Views
             s.Payments.Where(p => p.DueDate == s.Date).Sum(p => p.Amount) +
             requiredPayments.Where(p => RequiredPaymentRules.AppliesOn(p, s.Date)).Sum(p => p.Amount);
         row.Children.Add(Metric("Այսօրվա վճարումներ", A(plannedPayments), "Սեղմեք՝ վճարումների ցանկը տեսնելու համար", openPayments));
+        row.Children.Add(Metric("Այսօրվա վաճառք", A(s.Sales.SalesAmount), ChangeHint(s.Sales.SalesChange, "նախորդ օրվա համեմատ")));
+        row.Children.Add(Metric("Շահույթ", A(s.Sales.Profit), ChangeHint(s.Sales.ProfitChange, "նախորդ օրվա համեմատ")));
         row.Children.Add(Metric("Կրիտիկական ռիսկեր", s.Recommendations.Count(x => x.Severity == Severity.Critical).ToString(), "Սեղմեք՝ ռիսկերը տեսնելու համար", openRisks));
+        row.Children.Add(Metric("Կտրոններ", s.Sales.ReceiptCount.ToString("N0"), ChangeHint(s.Sales.ReceiptChange, "նախորդ օրվա համեմատ")));
         row.Children.Add(Metric("Սպասվող հաստատումներ", pendingApprovals.ToString(), pendingApprovals == 0 ? "Նոր հաստատում չկա" : "Սեղմեք՝ փոփոխությունները տեսնելու համար", openApprovals));
         root.Children.Add(row);
         root.Children.Add(PaymentSummaryBlock(s, completedPayments, requiredPayments, supplierRows, employeeSupplierActions));
