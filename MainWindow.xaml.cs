@@ -635,6 +635,11 @@ public partial class MainWindow : Window
                     continue;
                 }
                 var command = message.Text.Trim().ToLowerInvariant();
+                if (command.StartsWith("վերլուծություն", StringComparison.OrdinalIgnoreCase) || command.StartsWith("/վերլուծություն", StringComparison.OrdinalIgnoreCase))
+                {
+                    await SendTelegramCashFlowOpinionAsync(settings, TryTelegramDate(message.Text, out var analysisDate) ? analysisDate : DateOnly.FromDateTime(DateTime.Today));
+                    continue;
+                }
                 if (command is "սկսել" or "/սկսել" or "/start")
                     await SendTelegramDraftAsync(settings);
                 else if (command.StartsWith("առաջարկ", StringComparison.OrdinalIgnoreCase) || command.StartsWith("/առաջարկ", StringComparison.OrdinalIgnoreCase))
