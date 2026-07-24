@@ -526,6 +526,10 @@ public partial class MainWindow : Window
                 {
                     await ProcessEmployeeActionCallbackAsync(settings, message);
                 }
+                else if (message.Text.StartsWith("աշխատավարձ", StringComparison.OrdinalIgnoreCase))
+                {
+                    await RegisterSalaryFromEmployeeTelegramAsync(message, replySettings);
+                }
                 else if (message.Text.Equals("/start", StringComparison.OrdinalIgnoreCase))
                 {
                     await TelegramBotClient.SendMessageAsync(replySettings,
@@ -970,6 +974,34 @@ public partial class MainWindow : Window
         await TelegramBotClient.SendMessageAsync(settings, message.ToString(), buttons);
     }
 
+    private async Task RegisterSalaryFromEmployeeTelegramAsync(EmployeeTelegramIncomingMessage message, TelegramBotSettings replySettings)
+    {
+        if (!SalaryTelegramParser.TryParse(message.Text.Trim(), DateOnly.FromDateTime(DateTime.Today), out var date, out var employee, out var amount, out var note))
+        {
+            await TelegramBotClient.SendMessageAsync(replySettings, "Գրեք այս ձևով՝\nաշխատավարձ / Աշխատողի անուն / 12000 / նշում\nկամ՝\nաշխատավարձ / Աշխատողի անուն / 12000 / 17,07,2026");
+            return;
+        }
+        var knownEmployees = _salaryAccruals.Select(x => x.Employee).Concat(_salaryPayments.Select(x => x.Employee));
+        var matched = SalaryEmployeeMatcher.FindKnown(employee, knownEmployees);
+        var ownerSettings = _telegramBotSettingsStore.Load();
+        if (matched is null)
+        {
+            _pendingSalaryEmployees.Add(new PendingSalaryEmployee(Guid.NewGuid(), new SalaryAccrual(Guid.NewGuid(), date, employee, amount, note, DateTime.Now), DateTime.Now));
+            _pendingSalaryEmployeeStore.Save(_pendingSalaryEmployees);
+            await TelegramBotClient.SendMessageAsync(replySettings, $"🟡 «{employee}»-ի աշխատավարձը ուղարկվել է տնօրենի հաստատման։");
+            if (ownerSettings.IsConfigured && !string.IsNullOrWhiteSpace(ownerSettings.ChatId))
+                await TelegramBotClient.SendMessageAsync(ownerSettings, $"🟡 Աշխատակից {message.DisplayName}-ը ավելացրել է նոր աշխատող՝ {employee}։\n{date:dd.MM.yyyy} · {amount:N0} ֏\nՀաստատեք «Աշխատավարձեր» բաժնից։");
+            return;
+        }
+        var repeated = _salaryAccruals.Count(x => x.Date == date && string.Equals(x.Employee, matched, StringComparison.OrdinalIgnoreCase));
+        _salaryAccruals.Add(new SalaryAccrual(Guid.NewGuid(), date, matched, amount, note, DateTime.Now));
+        _salaryStore.SaveAccruals(_salaryAccruals);
+        await TelegramBotClient.SendMessageAsync(replySettings, $"✅ Գրանցվեց՝ {matched}, {date:dd.MM.yyyy}, {amount:N0} ֏։");
+        if (ownerSettings.IsConfigured && !string.IsNullOrWhiteSpace(ownerSettings.ChatId) && repeated > 0)
+            await TelegramBotClient.SendMessageAsync(ownerSettings, $"⚠️ Կրկնվող աշխատավարձային գրառում\nԱշխատող՝ {matched}\nՕր՝ {date:dd.MM.yyyy}\nՆոր գումար՝ {amount:N0} ֏\nՆույն օրվա նախկին գրառումներ՝ {repeated}։ Ստուգեք «Աշխատավարձեր» բաժնից։");
+        if (_currentPage == "Salaries") await LoadAsync("Salaries");
+    }
+
     private async Task RegisterSalaryFromTelegramAsync(TelegramBotSettings settings, string message)
     {
         if (!SalaryTelegramParser.TryParse(message, DateOnly.FromDateTime(DateTime.Today), out var date, out var employee, out var amount, out var note))
@@ -989,11 +1021,14 @@ public partial class MainWindow : Window
             return;
         }
         if (matchedEmployee is not null) employee = matchedEmployee;
+        var repeated = _salaryAccruals.Count(x => x.Date == date && string.Equals(x.Employee, employee, StringComparison.OrdinalIgnoreCase));
         _salaryAccruals.Add(new SalaryAccrual(Guid.NewGuid(), date, employee, amount, note, DateTime.Now));
         _salaryStore.SaveAccruals(_salaryAccruals);
         var weekStart = SalaryRules.WeekStart(date);
         var currentTotal = SalaryRules.AccruedForWeek(_salaryAccruals, weekStart, employee);
         await TelegramBotClient.SendMessageAsync(settings, $"✅ Գրանցվեց։\n\nԱշխատող՝ {employee}\nՕր՝ {date:dd.MM.yyyy}\nՕրական աշխատավարձ՝ {amount:N0} ֏\nԱյս շաբաթ գեներացված՝ {currentTotal:N0} ֏");
+        if (repeated > 0)
+            await TelegramBotClient.SendMessageAsync(settings, $"⚠️ Նույն աշխատողի համար {date:dd.MM.yyyy}-ին արդեն կար {repeated} գրառում։ Այս նոր {amount:N0} ֏ գումարն ավելացվել է առանձին տողով։ Ստուգեք «Աշխատավարձեր» բաժնից։");
         if (_currentPage == "Salaries") await LoadAsync("Salaries");
     }
 

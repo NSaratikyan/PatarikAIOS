@@ -13,26 +13,24 @@ public static class SalaryTelegramParser
         var first = parts[0];
         if (!first.StartsWith("աշխատավարձ", StringComparison.OrdinalIgnoreCase)) return false;
         var tail = first["աշխատավարձ".Length..].Trim();
-        var employeeIndex = 1;
-        if (TryDate(tail, out var enteredDate))
-        {
-            date = enteredDate;
-        }
-        else if (!string.IsNullOrWhiteSpace(tail))
-        {
-            // Also allow: աշխատավարձ Լուսինե / 12000 / նշում
-            employee = tail; employeeIndex = 1;
-            if (parts.Length < 2 || !TryAmount(parts[1], out amount)) return false;
-            note = parts.Length > 2 ? string.Join(" / ", parts.Skip(2)) : string.Empty;
-            return true;
-        }
-        if (parts.Length <= employeeIndex + 1 || !TryAmount(parts[employeeIndex + 1], out amount)) return false;
-        employee = parts[employeeIndex];
-        note = parts.Length > employeeIndex + 2 ? string.Join(" / ", parts.Skip(employeeIndex + 2)) : string.Empty;
-        return !string.IsNullOrWhiteSpace(employee);
+        if (TryDate(tail, out var firstDate)) date = firstDate;
+
+        var detailParts = parts.Skip(1).ToList();
+        var dateIndex = detailParts.FindIndex(x => TryDate(x, out _));
+        if (dateIndex >= 0 && TryDate(detailParts[dateIndex], out var enteredDate)) date = enteredDate;
+        var amountIndex = detailParts.FindIndex(TryAmountOnly);
+        if (amountIndex < 0) return false;
+        amount = ParseAmount(detailParts[amountIndex]);
+        var employeeParts = detailParts.Where((_, index) => index != dateIndex && index != amountIndex).ToList();
+        if (!string.IsNullOrWhiteSpace(tail) && !TryDate(tail, out _)) employeeParts.Insert(0, tail);
+        if (employeeParts.Count == 0) return false;
+        employee = employeeParts[0].Trim();
+        note = employeeParts.Count > 1 ? string.Join(" / ", employeeParts.Skip(1)) : string.Empty;
+        return !string.IsNullOrWhiteSpace(employee) && amount > 0m;
     }
 
     private static bool TryDate(string value, out DateOnly date) =>
-        DateOnly.TryParseExact(value, ["dd.MM.yyyy", "d.M.yyyy", "dd/MM/yyyy", "d/M/yyyy"], CultureInfo.InvariantCulture, DateTimeStyles.None, out date);
-    private static bool TryAmount(string value, out decimal amount) => decimal.TryParse(value.Replace(" ", "").Replace(",", ""), NumberStyles.Number, CultureInfo.InvariantCulture, out amount);
+        DateOnly.TryParseExact(value.Replace(',', '.'), ["dd.MM.yyyy", "d.M.yyyy", "dd/MM/yyyy", "d/M/yyyy"], CultureInfo.InvariantCulture, DateTimeStyles.None, out date);
+    private static bool TryAmountOnly(string value) => decimal.TryParse(value.Replace(" ", "").Replace(",", ""), NumberStyles.Number, CultureInfo.InvariantCulture, out var amount) && amount > 0m;
+    private static decimal ParseAmount(string value) => decimal.Parse(value.Replace(" ", "").Replace(",", ""), NumberStyles.Number, CultureInfo.InvariantCulture);
 }
