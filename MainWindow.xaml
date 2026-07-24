@@ -18,6 +18,7 @@
         <Button x:Name="CashImportButton" Content="Ներմուծել դրամարկղային ֆայլ" Click="ImportCashDocument_Click" HorizontalContentAlignment="Left" Background="#0F766E" Foreground="White" Margin="0,16,0,0"/>
         <Button Content="📊  Ամփոփում" Tag="Summary" Click="Navigate_Click" HorizontalContentAlignment="Left"/>
         <Button x:Name="CashAdjustmentButton" Content="✎  Դրամարկղի ուղղում" Click="AddCashDeskAdjustment_Click" HorizontalContentAlignment="Left"/>
+        <Button Content="👥  Աշխատավարձեր" Tag="Salaries" Click="Navigate_Click" HorizontalContentAlignment="Left"/>
         <Separator Margin="0,18,0,10"/>
         <TextBlock Text="ՀԾ ինտեգրում" Foreground="#94A3B8"/>
         <TextBlock x:Name="DataSourceStatusText" Text="Տվյալների աղբյուր՝ Demo" Foreground="White" TextWrapping="Wrap" Margin="0,6,0,0"/>

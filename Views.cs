@@ -50,6 +50,48 @@ public static class Views
         return new ScrollViewer { Content = root, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
     }
 
+    public static UIElement Salaries(DateOnly selectedDate, IReadOnlyList<SalaryAccrual> accruals, IReadOnlyList<SalaryPayment> payments, Action addAccrual, Action addPayment)
+    {
+        var weekStart = SalaryRules.WeekStart(selectedDate);
+        var employees = accruals.Select(x => x.Employee).Concat(payments.Select(x => x.Employee)).Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(x => x).ToList();
+        var root = new StackPanel();
+        root.Children.Add(Text("Աշխատավարձերի հաշվառում", 19, FontWeights.SemiBold));
+        root.Children.Add(Text($"Հաշվարկային շաբաթ՝ {weekStart:dd.MM.yyyy} – {weekStart.AddDays(6):dd.MM.yyyy}. Աշխատավարձը վճարման ենթակա է կիրակի օրը։", 13, null, BrushFor("#64748B")));
+        var actions = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 12, 0, 12) };
+        var add = new Button { Content = "＋ Օրական աշխատավարձ", Background = BrushFor("#0F766E"), Foreground = Brushes.White };
+        add.Click += (_, _) => addAccrual();
+        var pay = new Button { Content = "✓ Աշխատավարձ վճարել", Margin = new Thickness(10, 0, 0, 0) };
+        pay.Click += (_, _) => addPayment();
+        actions.Children.Add(add); actions.Children.Add(pay); root.Children.Add(actions);
+
+        var weeklyAccrued = SalaryRules.AccruedForWeek(accruals, weekStart);
+        var weeklyPaid = SalaryRules.PaidForWeek(payments, weekStart);
+        root.Children.Add(Section("Շաբաթվա ընդհանուր պատկերը", new[]
+        {
+            $"Գեներացված աշխատավարձ՝ {A(weeklyAccrued)}",
+            $"Վճարված աշխատավարձ՝ {A(weeklyPaid)}",
+            $"Վճարման ենթակա մնացորդ՝ {A(weeklyAccrued - weeklyPaid)}"
+        }));
+
+        var grid = NewGrid("Աշխատող", "Շաբաթվա գեներացված", "Վճարված", "Մնացորդ", "Վերջին գրառում");
+        foreach (var employee in employees)
+        {
+            var personAccruals = accruals.Where(x => string.Equals(x.Employee, employee, StringComparison.OrdinalIgnoreCase)).OrderByDescending(x => x.Date).ToList();
+            var accrued = SalaryRules.AccruedForWeek(accruals, weekStart, employee);
+            var paid = SalaryRules.PaidForWeek(payments, weekStart, employee);
+            var latest = personAccruals.FirstOrDefault();
+            AddRow(grid, employee, A(accrued), A(paid), A(accrued - paid), latest is null ? "—" : $"{latest.Date:dd.MM} · {latest.Note}");
+        }
+        root.Children.Add(Card(new StackPanel { Children = { Text("Աշխատողներ", 16, FontWeights.SemiBold), grid } }));
+        root.Children.Add(Section("Ինչպես է աշխատում", new[]
+        {
+            "Մենեջերը ամեն օր գրանցում է տվյալ աշխատողի փաստացի գեներացված գումարը։",
+            "Կիրակի օրը կուտակված, չվճարված գումարը մտնում է պարտադիր շաբաթական ծախսերի և ֆինանսական վերլուծության մեջ։",
+            "Վճարելուց հետո գումարը գրանցվում է տվյալ շաբաթի աշխատողի անվան դիմաց, իսկ մնացորդը անմիջապես նվազում է։"
+        }));
+        return new ScrollViewer { Content = root, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
+    }
+
     public static UIElement Finance(DashboardSnapshot s)
     {
         var root = new StackPanel(); root.Children.Add(Text("Ֆինանսական կենտրոն", 19, FontWeights.SemiBold));
@@ -185,7 +227,7 @@ public static class Views
         return new ScrollViewer { Content = root, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Auto };
     }
 
-    public static UIElement Payments(DashboardSnapshot s, IReadOnlyList<CompletedPayment> completedPayments, IReadOnlyList<RequiredPaymentTemplate> requiredPayments, IReadOnlyList<SupplierWeekPlanRow> supplierRows, IReadOnlyList<EmployeeSupplierAction> employeeSupplierActions, Action<RequiredPaymentTemplate> editPayment, Action<RequiredPaymentTemplate> deletePayment)
+    public static UIElement Payments(DashboardSnapshot s, IReadOnlyList<CompletedPayment> completedPayments, IReadOnlyList<RequiredPaymentTemplate> requiredPayments, IReadOnlyList<SupplierWeekPlanRow> supplierRows, IReadOnlyList<EmployeeSupplierAction> employeeSupplierActions, decimal plannedSalary, Action<RequiredPaymentTemplate> editPayment, Action<RequiredPaymentTemplate> deletePayment)
     {
         var isPast = s.Date < DateOnly.FromDateTime(DateTime.Today);
         var root = new StackPanel(); root.Children.Add(Text("Վճարումների պլան", 19, FontWeights.SemiBold));
@@ -200,7 +242,7 @@ public static class Views
         var supplierActualTotal = supplierCompleted.Sum(x => x.Amount);
         var otherRequired = requiredPayments.Where(x => RequiredPaymentRules.AppliesOn(x, s.Date)).ToList();
         var otherPlanItems = s.Payments.Where(x => x.DueDate == s.Date && !supplierNames.Contains(x.Supplier)).ToList();
-        var otherPlannedTotal = otherRequired.Sum(x => x.Amount) + otherPlanItems.Sum(x => x.Amount);
+        var otherPlannedTotal = otherRequired.Sum(x => x.Amount) + otherPlanItems.Sum(x => x.Amount) + plannedSalary;
         var otherActualTotal = otherCompleted.Sum(x => x.Amount);
         var daySummary = new StackPanel();
         daySummary.Children.Add(PaymentGroupExpander("Մատակարարների վճարներ", supplierPlannedTotal, supplierActualTotal, SupplierPaymentDetails(supplierItems, supplierPlanItems, supplierCompleted)));
