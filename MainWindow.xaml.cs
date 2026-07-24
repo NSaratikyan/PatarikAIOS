@@ -33,6 +33,7 @@ public partial class MainWindow : Window
     private readonly AvailableFundsStore _availableFundsStore = new();
     private readonly CashDeskAdjustmentStore _cashDeskAdjustmentStore = new();
     private readonly LocalPurchaseProposalStore _purchaseProposalStore = new();
+    private readonly CashFlowPolicyStore _cashFlowPolicyStore = new();
     private readonly List<PaymentChangeDraft> _manualPaymentChanges;
     private readonly List<CompletedPayment> _completedPayments;
     private readonly List<RequiredPaymentTemplate> _requiredPayments;
@@ -953,6 +954,7 @@ public partial class MainWindow : Window
 
     private async Task SendTelegramCashFlowOpinionAsync(TelegramBotSettings settings, DateOnly startDate)
     {
+        var policy = _cashFlowPolicyStore.LoadOrCreate();
         var snapshot = await TelegramSnapshotAsync(startDate);
         var funds = _lastFunds ?? FundsForOpening(snapshot.Cash);
         var historicalSales = 0m;
@@ -974,7 +976,7 @@ public partial class MainWindow : Window
             + snapshot.Payments.Where(x => x.DueDate == day && x.IsMandatory).Sum(x => x.Amount);
 
         var actualToday = startDate == DateOnly.FromDateTime(DateTime.Today) ? snapshot.Sales.SalesAmount : (decimal?)null;
-        var analysis = CashFlowPlanner.Build(startDate, funds.Total, historicalSales, hasHistory, actualToday,
+        var analysis = CashFlowPlanner.Build(startDate, funds.Total, historicalSales, hasHistory, actualToday, policy.MinimumReserve,
             day => PlannedSuppliersFor(day), MandatoryPayments);
 
         var text = new System.Text.StringBuilder();
@@ -994,6 +996,9 @@ public partial class MainWindow : Window
         foreach (var day in analysis.Days)
             text.AppendLine($"• {day.Date:dd.MM}: վաճառք {day.ExpectedSales:N0} ֏ | վճարումներ {day.PlannedPayments:N0} ֏ | մնացորդ {day.ClosingBalance:N0} ֏");
 
+        text.AppendLine($"Պաշտպանական նվազագույն մնացորդ՝ {policy.MinimumReserve:N0} ֏");
+        text.AppendLine("Չտեղափոխվող վճարումներ՝ կոմունալ, վարձավճար, Տոբակ, Նեվիս, Վինկո, Ֆիլիպ Մորիս, Մարիաննա, Ալյուր։");
+
         if (!hasHistory)
         {
             text.AppendLine();
@@ -1004,14 +1009,20 @@ public partial class MainWindow : Window
             text.AppendLine();
             text.AppendLine("✅ Ըստ ընթացիկ պլանի շաբաթվա դրամական հոսքը հավասարակշռված է։");
         }
-        else if (analysis.WeekClosingBalance >= 0m)
+        else if (analysis.WeekClosingBalance >= policy.MinimumReserve)
         {
             var firstDeficit = analysis.DeficitDays[0];
             var flexible = PlannedSuppliersFor(firstDeficit.Date)
                 .Where(x => x.PaymentAmount + x.OldDebtPayment > 0m)
+                .Where(x => !policy.NonMovableSuppliers.Any(rule => CashFlowSupplierRuleMatches(rule, x.Supplier)))
                 .OrderBy(x => snapshot.Suppliers.FirstOrDefault(s => SupplierNamesMatch(s.Name, x.Supplier))?.PriorityScore ?? 50)
                 .ToList();
             text.AppendLine();
+            text.AppendLine($"🟡 {firstDeficit.Date:dd.MM}-ին կանխատեսվող մնացորդը պաշտպանական շեմից պակաս է {policy.MinimumReserve - firstDeficit.ClosingBalance:N0} ֏-ով։ Շաբաթվա վերջում շեմը վերականգնվում է։");
+            if (flexible.Count == 0)
+                text.AppendLine("Այս օրվա համար տեղափոխելի մատակարարային վճարում չկա․ անհրաժեշտ է տնօրենի որոշում կամ ֆինանսական մասնագետի կարծիք։ ");
+            else
+                text.AppendLine("Առաջարկվող ճկուն վճարները՝ " + string.Join(", ", flexible.Take(3).Select(x => x.Supplier)) + "։");
             text.AppendLine($"🟡 {firstDeficit.Date:dd.MM}-ին օրվա դրամական պակասը՝ {Math.Abs(firstDeficit.ClosingBalance):N0} ֏, բայց շաբաթվա վերջում գումարը բավարար է։");
             text.AppendLine("Առաջարկ՝ պարտադիր վճարումները չտեղափոխել։ Նախ դիտարկել միայն մատակարարների ճկուն վճարումները՝");
             foreach (var row in flexible.Take(3))
@@ -1020,10 +1031,18 @@ public partial class MainWindow : Window
         else
         {
             text.AppendLine();
+            text.AppendLine($"🔴 Շաբաթվա ավարտին պաշտպանական շեմից պակաս է {policy.MinimumReserve - analysis.WeekClosingBalance:N0} ֏։ Չփոխել կոմունալի, վարձավճարի և պաշտպանված մատակարարների վճարումները։");
             text.AppendLine($"🔴 Շաբաթվա կանխատեսվող պակասը՝ {Math.Abs(analysis.WeekClosingBalance):N0} ֏։ Միայն վճարումների տեղափոխումը բավարար չէ։");
             text.AppendLine("Առաջարկ՝ չհաստատել ոչ պարտադիր գնումներ, մատակարարների հետ վերանայել ժամկետները և դիմել հաշվապահ/ֆինանսական մասնագետի՝ վճարումների ու վաճառքի պլանը հաստատելու համար։");
         }
         await TelegramBotClient.SendMessageAsync(settings, text.ToString());
+    }
+
+    private static bool CashFlowSupplierRuleMatches(string rule, string supplier)
+    {
+        var a = new string(rule.ToLowerInvariant().Where(char.IsLetterOrDigit).ToArray());
+        var b = new string(supplier.ToLowerInvariant().Where(char.IsLetterOrDigit).ToArray());
+        return a.Length > 0 && b.Length > 0 && (a.Contains(b) || b.Contains(a));
     }
 
     private async Task SendTelegramMorningBriefAsync(TelegramBotSettings settings, DateOnly date)

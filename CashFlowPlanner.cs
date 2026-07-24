@@ -19,6 +19,7 @@ public sealed record CashFlowAnalysis(
     decimal OpeningBalance,
     decimal HistoricalDailySales,
     bool HasSalesHistory,
+    decimal MinimumReserve,
     IReadOnlyList<CashFlowDayPlan> Days)
 {
     public decimal WeekExpectedSales => Days.Sum(x => x.ExpectedSales);
@@ -26,7 +27,8 @@ public sealed record CashFlowAnalysis(
     public decimal WeekMandatoryPayments => Days.Sum(x => x.MandatoryPayments);
     public decimal WeekOrders => Days.Sum(x => x.PlannedOrders);
     public decimal WeekClosingBalance => Days.LastOrDefault()?.ClosingBalance ?? OpeningBalance;
-    public IReadOnlyList<CashFlowDayPlan> DeficitDays => Days.Where(x => x.ClosingBalance < 0m).ToList();
+    /// <summary>Days where the balance is below the owner's safety reserve.</summary>
+    public IReadOnlyList<CashFlowDayPlan> DeficitDays => Days.Where(x => x.ClosingBalance < MinimumReserve).ToList();
 }
 
 public static class CashFlowPlanner
@@ -37,6 +39,7 @@ public static class CashFlowPlanner
         decimal historicalDailySales,
         bool hasSalesHistory,
         decimal? actualSalesForStartDate,
+        decimal minimumReserve,
         Func<DateOnly, IReadOnlyList<SupplierWeekPlanRow>> supplierPlan,
         Func<DateOnly, decimal> mandatoryPayments)
     {
@@ -55,6 +58,6 @@ public static class CashFlowPlanner
             balance += expectedSales - supplierPayments - mandatory;
             days.Add(new CashFlowDayPlan(date, expectedSales, orders, supplierPayments, mandatory, balance));
         }
-        return new CashFlowAnalysis(openingBalance, historicalDailySales, hasSalesHistory, days);
+        return new CashFlowAnalysis(openingBalance, historicalDailySales, hasSalesHistory, minimumReserve, days);
     }
 }
