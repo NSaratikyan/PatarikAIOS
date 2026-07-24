@@ -6,4 +6,9 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
+  <ItemGroup>
+    <!-- The Automation Host is a separate executable and must not be compiled
+         into the WPF desktop application. -->
+    <Compile Remove="Automation\**\*.cs" />
+  </ItemGroup>
 </Project>

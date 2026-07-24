@@ -17,5 +17,6 @@ data/
 .idea/
 *.user
 *.suo
+Automation/publish/
 Thumbs.db
 Desktop.ini

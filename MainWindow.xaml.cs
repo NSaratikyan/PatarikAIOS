@@ -75,8 +75,14 @@ public partial class MainWindow : Window
         {
             _uiReady = true;
             await LoadAsync("Dashboard");
-            StartTelegramPolling();
-            StartEmployeeTelegramPolling();
+            // Exactly one process is allowed to handle Telegram polling and timed
+            // messages.  Normally this is the Automation Host. If it is not
+            // running, an open desktop application safely takes over instead.
+            if (((App)Application.Current).TryAcquireTelegramAutomationLease())
+            {
+                StartTelegramPolling();
+                StartEmployeeTelegramPolling();
+            }
         };
     }
 
