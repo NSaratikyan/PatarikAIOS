@@ -19,9 +19,11 @@ public static class Views
         IReadOnlyList<EmployeeSupplierAction> employeeSupplierActions,
         CashDailySummary? cashSummary,
         AvailableFundsBreakdown funds,
+        int pendingApprovals,
         Action openFunds,
         Action openPayments,
-        Action openRisks)
+        Action openRisks,
+        Action openApprovals)
     {
         var root = new StackPanel();
         root.Children.Add(Text("CEO Dashboard — օրվա վերահսկման կենտրոն", 19, FontWeights.SemiBold));
@@ -33,12 +35,11 @@ public static class Views
             s.Payments.Where(p => p.DueDate == s.Date).Sum(p => p.Amount) +
             requiredPayments.Where(p => RequiredPaymentRules.AppliesOn(p, s.Date)).Sum(p => p.Amount);
         row.Children.Add(Metric("Այսօրվա վճարումներ", A(plannedPayments), "Սեղմեք՝ վճարումների ցանկը տեսնելու համար", openPayments));
-        row.Children.Add(Metric("Այսօրվա վաճառք", A(s.Sales.SalesAmount), ChangeHint(s.Sales.SalesChange, "նախորդ օրվա համեմատ")));
-        row.Children.Add(Metric("Շահույթ", A(s.Sales.Profit), ChangeHint(s.Sales.ProfitChange, "նախորդ օրվա համեմատ")));
         row.Children.Add(Metric("Կրիտիկական ռիսկեր", s.Recommendations.Count(x => x.Severity == Severity.Critical).ToString(), "Սեղմեք՝ ռիսկերը տեսնելու համար", openRisks));
-        row.Children.Add(Metric("Կտրոններ", s.Sales.ReceiptCount.ToString("N0"), ChangeHint(s.Sales.ReceiptChange, "նախորդ օրվա համեմատ")));
+        row.Children.Add(Metric("Սպասվող հաստատումներ", pendingApprovals.ToString(), pendingApprovals == 0 ? "Նոր հաստատում չկա" : "Սեղմեք՝ փոփոխությունները տեսնելու համար", openApprovals));
         root.Children.Add(row);
         root.Children.Add(PaymentSummaryBlock(s, completedPayments, requiredPayments, supplierRows, employeeSupplierActions));
+        root.Children.Add(EarlyWarningBlock(s, funds));
         if (cashSummary is not null) root.Children.Add(CashDocumentSummaryBlock(cashSummary));
         root.Children.Add(SalesBlock(s.Sales));
         root.Children.Add(Section("⚠ AI ուշադրության կենտրոն", s.Recommendations.Take(3).Select(r => $"{Icon(r.Severity)}  {r.Title}\n{r.Finding}\nԱռաջարկ՝ {r.SuggestedAction}")));
@@ -300,6 +301,80 @@ public static class Views
         root.Children.Add(Section("🔔 Հուշումներ", new[] { "Այս բաժինը հետագայում կներառի վճարումների, պաշարների և ժամկետների ավտոմատ հիշեցումներ։" }));
         return new ScrollViewer { Content = root };
     }
+
+    /// <summary>Owner approval queue for deviations reported by employees.</summary>
+    public static UIElement Approvals(IReadOnlyList<PendingEmployeeOrderChange> changes, Action<Guid> approve, Action<Guid> reject, Action approveAll)
+    {
+        var root = new StackPanel();
+        root.Children.Add(Text("Հաստատումների կենտրոն", 19, FontWeights.SemiBold));
+        root.Children.Add(Text("Այստեղ են աշխատակիցների նշած այն փաստացի տվյալները, որոնք տարբերվում են պլանից։ Հաստատումից հետո մատակարարի պլանը և պարտքի հաշվարկը թարմացվում են։", 13, null, BrushFor("#64748B")));
+
+        if (changes.Count == 0)
+        {
+            root.Children.Add(Card(Text("✅ Սպասող հաստատումներ չկան։", 15, FontWeights.SemiBold, BrushFor("#166534"))));
+            return new ScrollViewer { Content = root, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
+        }
+
+        var approveAllButton = new Button { Content = $"✓ Հաստատել բոլորը ({changes.Count})", Background = BrushFor("#166534"), Foreground = Brushes.White, Padding = new Thickness(12, 7, 12, 7), Margin = new Thickness(0, 14, 0, 12), HorizontalAlignment = HorizontalAlignment.Left };
+        approveAllButton.Click += (_, _) => approveAll();
+        root.Children.Add(approveAllButton);
+
+        var grid = NewGrid("Ամսաթիվ", "Մատակարար", "Պլան", "Փաստացի", "Շեղում", "Աշխատակից", "");
+        foreach (var item in changes.OrderBy(x => x.Date).ThenBy(x => x.Supplier))
+        {
+            var planned = item.PlannedOrder + item.PlannedPayment + item.PlannedOldDebtPayment;
+            var actual = item.ActualOrder + item.ActualPayment + item.ActualOldDebtPayment;
+            var difference = actual - planned;
+            var actions = new StackPanel { Orientation = Orientation.Horizontal };
+            var yes = new Button { Content = "Հաստատել", Background = BrushFor("#166534"), Foreground = Brushes.White, Padding = new Thickness(8, 3, 8, 3) };
+            yes.Click += (_, _) => approve(item.Id);
+            var no = new Button { Content = "Մերժել", Margin = new Thickness(6, 0, 0, 0), Padding = new Thickness(8, 3, 8, 3) };
+            no.Click += (_, _) => reject(item.Id);
+            actions.Children.Add(yes); actions.Children.Add(no);
+            AddApprovalRow(grid,
+                item.Date.ToString("dd.MM.yyyy"), item.Supplier,
+                $"{A(item.PlannedOrder)} / {A(item.PlannedPayment)} / {A(item.PlannedOldDebtPayment)}",
+                $"{A(item.ActualOrder)} / {A(item.ActualPayment)} / {A(item.ActualOldDebtPayment)}",
+                SignedPlain(difference), item.ReportedByName, actions);
+        }
+        root.Children.Add(Card(grid));
+        root.Children.Add(Text("Ձևաչափը՝ պատվեր / նոր վճարում / հին պարտքի վճարում։", 12, null, BrushFor("#64748B")));
+        return new ScrollViewer { Content = root, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Auto };
+    }
+
+    private static UIElement EarlyWarningBlock(DashboardSnapshot snapshot, AvailableFundsBreakdown funds)
+    {
+        var negativeDay = snapshot.Forecast.OrderBy(x => x.Date).FirstOrDefault(x => x.ClosingBalance < 0m);
+        var lowDay = snapshot.Forecast.OrderBy(x => x.Date).FirstOrDefault(x => x.ClosingBalance >= 0m && x.ClosingBalance < funds.Total * 0.10m);
+        if (negativeDay is not null)
+            return Card(new StackPanel { Children =
+            {
+                Text("🔴 Դրամական հոսքի վաղ նախազգուշացում", 16, FontWeights.SemiBold, BrushFor("#B91C1C")),
+                Text($"{negativeDay.Date:dd.MM.yyyy}-ին կանխատեսվում է {A(negativeDay.ClosingBalance)} մնացորդ։"),
+                Text("Առաջարկ՝ վերանայել ոչ պարտադիր գնումները և վճարումների հերթականությունը։", 13, FontWeights.SemiBold)
+            }});
+        if (lowDay is not null)
+            return Card(new StackPanel { Children =
+            {
+                Text("🟡 Դրամական հոսքի դիտարկում", 16, FontWeights.SemiBold, BrushFor("#B45309")),
+                Text($"{lowDay.Date:dd.MM.yyyy}-ին կանխատեսվող մնացորդը ցածր է՝ {A(lowDay.ClosingBalance)}։"),
+                Text("Առաջարկ՝ պահել կանխիկի պահուստ և չավելացնել ոչ պարտադիր ծախսերը։", 13, FontWeights.SemiBold)
+            }});
+        return Card(Text("🟢 Առաջիկա կանխատեսվող դրամական հոսքը կառավարելի է։", 14, FontWeights.SemiBold, BrushFor("#166534")));
+    }
+
+    private static void AddApprovalRow(Grid grid, params UIElement[] cells)
+    {
+        var row = grid.RowDefinitions.Count; grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        for (var i = 0; i < cells.Length; i++)
+        {
+            if (cells[i] is FrameworkElement element) element.Margin = new Thickness(0, 8, 5, 8);
+            Grid.SetRow(cells[i], row); Grid.SetColumn(cells[i], i); grid.Children.Add(cells[i]);
+        }
+    }
+
+    private static void AddApprovalRow(Grid grid, string date, string supplier, string planned, string actual, string difference, string employee, UIElement actions) =>
+        AddApprovalRow(grid, Text(date), Text(supplier), Text(planned), Text(actual), Text(difference), Text(employee), actions);
 
     private static UIElement Metric(string title, string value, string hint, Action? click = null)
     {

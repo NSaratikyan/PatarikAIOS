@@ -729,11 +729,12 @@ public partial class MainWindow : Window
         actions.Add(new EmployeeSupplierAction(change.Date, change.Supplier, "Կատարված է", $"Նախնական՝ {change.PlannedOrder:N0}/{change.PlannedPayment:N0}/{change.PlannedOldDebtPayment:N0}; փաստացի ստացվել է՝ {change.ActualOrder:N0}/{change.ActualPayment:N0}/{change.ActualOldDebtPayment:N0}", change.ReportedByChatId, change.ReportedByName, DateTime.Now));
         _employeeSupplierActionStore.Save(actions);
         changes.RemoveAll(x => x.Id == changeId); _pendingEmployeeOrderChangeStore.Save(changes);
-        if (announceToOwner) await TelegramBotClient.SendMessageAsync(ownerSettings, $"✅ Գրանցվեց՝ {change.Supplier}, {change.Date:dd.MM.yyyy}։");
+        if (announceToOwner && ownerSettings.IsConfigured && !string.IsNullOrWhiteSpace(ownerSettings.ChatId))
+            await TelegramBotClient.SendMessageAsync(ownerSettings, $"✅ Գրանցվեց՝ {change.Supplier}, {change.Date:dd.MM.yyyy}։");
         var employeeSettings = _employeeTelegramBotSettingsStore.Load();
         if (employeeSettings.IsConfigured)
             await TelegramBotClient.SendMessageAsync(new TelegramBotSettings(employeeSettings.BotToken, change.ReportedByChatId), $"✅ Տնօրենը հաստատեց {change.Supplier}-ի պատվերի փոփոխությունը։");
-        if (_currentPage == "Suppliers" || _currentPage == "Recommendations") await LoadAsync(_currentPage);
+        if (_currentPage is "Suppliers" or "Recommendations" or "Approvals") await LoadAsync(_currentPage);
     }
 
     private async Task RejectEmployeeOrderChangeAsync(TelegramBotSettings ownerSettings, Guid changeId)
@@ -742,10 +743,12 @@ public partial class MainWindow : Window
         var change = changes.FirstOrDefault(x => x.Id == changeId);
         if (change is null) { await TelegramBotClient.SendMessageAsync(ownerSettings, "Այս փոփոխությունն արդեն մշակված է կամ չի գտնվել։"); return; }
         changes.RemoveAll(x => x.Id == changeId); _pendingEmployeeOrderChangeStore.Save(changes);
-        await TelegramBotClient.SendMessageAsync(ownerSettings, $"✕ Չհաստատվեց՝ {change.Supplier}, {change.Date:dd.MM.yyyy}։");
+        if (ownerSettings.IsConfigured && !string.IsNullOrWhiteSpace(ownerSettings.ChatId))
+            await TelegramBotClient.SendMessageAsync(ownerSettings, $"✕ Չհաստատվեց՝ {change.Supplier}, {change.Date:dd.MM.yyyy}։");
         var employeeSettings = _employeeTelegramBotSettingsStore.Load();
         if (employeeSettings.IsConfigured)
             await TelegramBotClient.SendMessageAsync(new TelegramBotSettings(employeeSettings.BotToken, change.ReportedByChatId), $"ℹ️ Տնօրենը դեռ չի հաստատել {change.Supplier}-ի փոփոխությունը։");
+        if (_currentPage == "Approvals") await LoadAsync("Approvals");
     }
 
     private async Task AddEmployeeTaskFromTelegramAsync(TelegramBotSettings settings, string message)
@@ -1345,11 +1348,36 @@ public partial class MainWindow : Window
             "PurchasePlan" => await PurchasePlanViewAsync(),
             "SupplierSales" => await SupplierSalesViewAsync(),
             "Payments" => Views.Payments(_snapshot, _completedPayments, _requiredPayments, PlanForSelectedDate(), _employeeSupplierActionStore.Load(), EditRequiredPayment, DeleteRequiredPayment),
+            "Approvals" => Views.Approvals(_pendingEmployeeOrderChangeStore.Load(), ApprovePendingChangeFromDesktopAsync, RejectPendingChangeFromDesktopAsync, ApproveAllPendingChangesFromDesktopAsync),
             "DeliverySchedule" => Views.DeliverySchedule(_deliveryPatterns, UpdateSuggestedOrderAmount),
             "Recommendations" => Views.Recommendations(_snapshot, _employeeSupplierActionStore.Load(), _employeeTaskStore.Load(), _employeeTaskActionStore.Load(), _employeeIssueStore.Load()),
             "Summary" => await SummaryViewAsync(),
-            _ => Views.Dashboard(_snapshot, _completedPayments, _requiredPayments, PlanForSelectedDate(), _employeeSupplierActionStore.Load(), CashSummaryForSelectedDate(), _lastFunds ?? FundsForOpening(_snapshot.Cash), OpenAvailableFunds, () => _ = LoadAsync("Payments"), () => _ = LoadAsync("Recommendations"))
+            _ => Views.Dashboard(_snapshot, _completedPayments, _requiredPayments, PlanForSelectedDate(), _employeeSupplierActionStore.Load(), CashSummaryForSelectedDate(), _lastFunds ?? FundsForOpening(_snapshot.Cash), _pendingEmployeeOrderChangeStore.Load().Count, OpenAvailableFunds, () => _ = LoadAsync("Payments"), () => _ = LoadAsync("Recommendations"), () => _ = LoadAsync("Approvals"))
         };
+    }
+
+    private async void ApprovePendingChangeFromDesktopAsync(Guid id)
+    {
+        var settings = _telegramBotSettingsStore.Load();
+        await ApproveEmployeeOrderChangeAsync(settings, id, announceToOwner: false);
+        await LoadAsync("Approvals");
+    }
+
+    private async void RejectPendingChangeFromDesktopAsync(Guid id)
+    {
+        var settings = _telegramBotSettingsStore.Load();
+        await RejectEmployeeOrderChangeAsync(settings, id);
+        await LoadAsync("Approvals");
+    }
+
+    private async void ApproveAllPendingChangesFromDesktopAsync()
+    {
+        var changes = _pendingEmployeeOrderChangeStore.Load();
+        if (changes.Count == 0) return;
+        if (MessageBox.Show($"Հաստատե՞լ բոլոր {changes.Count} փոփոխությունները։", "Հաստատումներ", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
+        var settings = _telegramBotSettingsStore.Load();
+        foreach (var change in changes) await ApproveEmployeeOrderChangeAsync(settings, change.Id, announceToOwner: false);
+        await LoadAsync("Approvals");
     }
 
     private void UpdateTopActions(string page)
