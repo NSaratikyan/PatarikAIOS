@@ -31,6 +31,7 @@ public partial class MainWindow : Window
     private readonly OwnerPendingEmployeeIssueReplyStore _ownerPendingEmployeeIssueReplyStore = new();
     private readonly AvailableFundsStore _availableFundsStore = new();
     private readonly CashDeskAdjustmentStore _cashDeskAdjustmentStore = new();
+    private readonly LocalPurchaseProposalStore _purchaseProposalStore = new();
     private readonly List<PaymentChangeDraft> _manualPaymentChanges;
     private readonly List<CompletedPayment> _completedPayments;
     private readonly List<RequiredPaymentTemplate> _requiredPayments;
@@ -1008,6 +1009,12 @@ public partial class MainWindow : Window
             catch { /* Send the supplier schedule even if the optional stock report is unavailable. */ }
         }
 
+        // The product-level calculation is retained by delivery date. If HTS is
+        // temporarily unavailable later, the owner still receives the last plan
+        // instead of an empty draft.
+        if (proposals.Count > 0) _purchaseProposalStore.Save(deliveryDate, proposals);
+        else proposals = _purchaseProposalStore.Load(deliveryDate);
+
         var supplierPayments = scheduled.Sum(x => x.PaymentAmount + x.OldDebtPayment);
         var otherPayments = _requiredPayments.Where(x => RequiredPaymentRules.AppliesOn(x, deliveryDate)).Sum(x => x.Amount) +
             _manualPaymentChanges.Where(x => x.PlannedDate == deliveryDate).Sum(x => x.Amount);
@@ -1525,6 +1532,10 @@ public partial class MainWindow : Window
     {
         var deliveryDate = _selectedDate.AddDays(1);
         var scheduled = PlannedSuppliersFor(deliveryDate);
+        var savedOrFreshProposals = await GetOrBuildPurchaseProposalsAsync(_selectedDate, deliveryDate, scheduled, showErrors: true);
+        return Views.PurchasePlan(_selectedDate, deliveryDate, scheduled, savedOrFreshProposals);
+
+#pragma warning disable CS0162 // Kept below temporarily as a reference for the previous API-only flow.
         var coverageDays = scheduled.Select(x => x.Supplier).Distinct(StringComparer.OrdinalIgnoreCase)
             .ToDictionary(x => x, x => DaysUntilNextDelivery(x, deliveryDate), StringComparer.OrdinalIgnoreCase);
         IReadOnlyList<PurchaseProposal> proposals = [];
@@ -1541,6 +1552,27 @@ public partial class MainWindow : Window
             }
         }
         return Views.PurchasePlan(_selectedDate, deliveryDate, scheduled, proposals);
+    }
+
+    private async Task<IReadOnlyList<PurchaseProposal>> GetOrBuildPurchaseProposalsAsync(DateOnly planningDate, DateOnly deliveryDate, IReadOnlyList<SupplierWeekPlanRow> scheduled, bool showErrors = false)
+    {
+        var supplierNames = scheduled.Select(x => x.Supplier).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        if (App.Services.DataProvider is not IPurchasePlanningProvider provider || supplierNames.Count == 0)
+            return _purchaseProposalStore.Load(deliveryDate);
+
+        var coverageDays = supplierNames.ToDictionary(x => x, x => DaysUntilNextDelivery(x, deliveryDate), StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            var proposals = await provider.GetPurchaseProposalsAsync(planningDate, deliveryDate, supplierNames, coverageDays);
+            if (proposals.Count > 0) _purchaseProposalStore.Save(deliveryDate, proposals);
+            return proposals.Count > 0 ? proposals : _purchaseProposalStore.Load(deliveryDate);
+        }
+        catch (Exception exception)
+        {
+            if (showErrors)
+                MessageBox.Show($"ՀԾ-ից պաշարների կամ վաճառքի տվյալները չեն ստացվել։\n{exception.Message}\n\nՑուցադրվում է վերջին պահպանված նախնական պատվերը, եթե առկա է։", "Նախնական պատվեր", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return _purchaseProposalStore.Load(deliveryDate);
+        }
     }
 
     private int DaysUntilNextDelivery(string supplier, DateOnly deliveryDate)
