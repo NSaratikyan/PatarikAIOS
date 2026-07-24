@@ -70,7 +70,10 @@ public sealed class HtsApiDataProvider(HtsApiSettings settings) : IHtsDataProvid
             Cash = baseSnapshot.Cash,
             Suppliers = apiSuppliers,
             SupplierMovements = dailyMovements,
-            Payments = baseSnapshot.Payments,
+            // Payments are built from HTS documents, supplier plans and the
+            // owner's required-payment database. Demo payments must never
+            // appear while the live HTS connection is active.
+            Payments = [],
             Forecast = baseSnapshot.Forecast,
             Sales = todaySales,
             Recommendations = baseSnapshot.Recommendations,
