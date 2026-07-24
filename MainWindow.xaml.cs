@@ -35,6 +35,7 @@ public partial class MainWindow : Window
     private readonly LocalPurchaseProposalStore _purchaseProposalStore = new();
     private readonly CashFlowPolicyStore _cashFlowPolicyStore = new();
     private readonly SalaryStore _salaryStore = new();
+    private readonly PendingSalaryEmployeeStore _pendingSalaryEmployeeStore = new();
     private readonly List<PaymentChangeDraft> _manualPaymentChanges;
     private readonly List<CompletedPayment> _completedPayments;
     private readonly List<RequiredPaymentTemplate> _requiredPayments;
@@ -49,6 +50,7 @@ public partial class MainWindow : Window
     private readonly List<CashDeskAdjustment> _cashDeskAdjustments;
     private readonly List<SalaryAccrual> _salaryAccruals;
     private readonly List<SalaryPayment> _salaryPayments;
+    private readonly List<PendingSalaryEmployee> _pendingSalaryEmployees;
     private AvailableFundsBreakdown? _lastFunds;
     private System.Windows.Threading.DispatcherTimer? _telegramPollTimer;
     private System.Windows.Threading.DispatcherTimer? _employeeTelegramPollTimer;
@@ -76,6 +78,7 @@ public partial class MainWindow : Window
         _cashDeskAdjustments = _cashDeskAdjustmentStore.Load();
         _salaryAccruals = _salaryStore.LoadAccruals();
         _salaryPayments = _salaryStore.LoadPayments();
+        _pendingSalaryEmployees = _pendingSalaryEmployeeStore.Load();
         InitializeComponent();
         ViewDatePicker.SelectedDate = _selectedDate.ToDateTime(TimeOnly.MinValue);
         ConfigureDataProvider();
@@ -974,6 +977,18 @@ public partial class MainWindow : Window
             await TelegramBotClient.SendMessageAsync(settings, "Չհաջողվեց կարդալ աշխատավարձի տվյալը։ Գրեք այս ձևով՝\n\nաշխատավարձ / Աշխատողի անուն / 12000 / նշում\n\nկամ՝\nաշխատավարձ 29.07.2026 / Աշխատողի անուն / 12000 / նշում");
             return;
         }
+        var knownEmployees = _salaryAccruals.Select(x => x.Employee).Concat(_salaryPayments.Select(x => x.Employee));
+        var matchedEmployee = SalaryEmployeeMatcher.FindKnown(employee, knownEmployees);
+        if (matchedEmployee is null && knownEmployees.Any())
+        {
+            var proposed = new SalaryAccrual(Guid.NewGuid(), date, employee, amount, note, DateTime.Now);
+            _pendingSalaryEmployees.Add(new PendingSalaryEmployee(Guid.NewGuid(), proposed, DateTime.Now));
+            _pendingSalaryEmployeeStore.Save(_pendingSalaryEmployees);
+            await TelegramBotClient.SendMessageAsync(settings, $"🟡 Նոր աշխատող «{employee}» — {amount:N0} ֏։ Տվյալը սպասում է տնօրենի հաստատմանը և դեռ չի ներառվել աշխատավարձային հաշվարկում։");
+            if (_currentPage == "Salaries") await LoadAsync("Salaries");
+            return;
+        }
+        if (matchedEmployee is not null) employee = matchedEmployee;
         _salaryAccruals.Add(new SalaryAccrual(Guid.NewGuid(), date, employee, amount, note, DateTime.Now));
         _salaryStore.SaveAccruals(_salaryAccruals);
         var weekStart = SalaryRules.WeekStart(date);
@@ -1525,8 +1540,8 @@ public partial class MainWindow : Window
             "Suppliers" => Views.Suppliers(PlanForSelectedDate(), _snapshot.Suppliers, _partnerDebts, _employeeSupplierActionStore.Load(), _supplierStatusChangeStore.Load(), SaveSupplierWeekRow, ShowSupplierEmployeeStatus, EditSupplierStatus),
             "PurchasePlan" => await PurchasePlanViewAsync(),
             "SupplierSales" => await SupplierSalesViewAsync(),
-            "Salaries" => Views.Salaries(_selectedDate, _salaryAccruals, _salaryPayments, AddSalaryAccrual, AddSalaryPayment),
-            "Payments" => Views.Payments(_snapshot, _completedPayments, _requiredPayments, PlanForSelectedDate(), _employeeSupplierActionStore.Load(), PlannedSundayPayroll(_selectedDate), EditRequiredPayment, DeleteRequiredPayment),
+            "Salaries" => Views.Salaries(_selectedDate, _salaryAccruals, _salaryPayments, _pendingSalaryEmployees, AddSalaryAccrual, AddSalaryPayment, OpenSalaryEmployee, ApprovePendingSalaryEmployee, RejectPendingSalaryEmployee),
+            "Payments" => Views.Payments(_snapshot, _completedPayments, _requiredPayments, PlanForSelectedDate(), _employeeSupplierActionStore.Load(), _salaryPayments, PlannedSundayPayroll(_selectedDate), EditRequiredPayment, DeleteRequiredPayment),
             "Approvals" => Views.Approvals(_pendingEmployeeOrderChangeStore.Load(), ApprovePendingChangeFromDesktopAsync, RejectPendingChangeFromDesktopAsync, ApproveAllPendingChangesFromDesktopAsync),
             "DeliverySchedule" => Views.DeliverySchedule(_deliveryPatterns, UpdateSuggestedOrderAmount),
             "Recommendations" => Views.Recommendations(_snapshot, _employeeSupplierActionStore.Load(), _employeeTaskStore.Load(), _employeeTaskActionStore.Load(), _employeeIssueStore.Load()),
@@ -1916,6 +1931,35 @@ public partial class MainWindow : Window
         await LoadAsync("Dashboard");
     }
 
+    private void ApprovePendingSalaryEmployee(Guid id)
+    {
+        var pending = _pendingSalaryEmployees.FirstOrDefault(x => x.Id == id);
+        if (pending is null) return;
+        _salaryAccruals.Add(pending.ProposedAccrual);
+        _pendingSalaryEmployees.RemoveAll(x => x.Id == id);
+        _salaryStore.SaveAccruals(_salaryAccruals);
+        _pendingSalaryEmployeeStore.Save(_pendingSalaryEmployees);
+        _ = LoadAsync("Salaries");
+    }
+
+    private void RejectPendingSalaryEmployee(Guid id)
+    {
+        _pendingSalaryEmployees.RemoveAll(x => x.Id == id);
+        _pendingSalaryEmployeeStore.Save(_pendingSalaryEmployees);
+        _ = LoadAsync("Salaries");
+    }
+
+    private void OpenSalaryEmployee(string employee)
+    {
+        var window = new SalaryEmployeeDetailsWindow(employee, SalaryRules.WeekStart(_selectedDate), _salaryAccruals, _salaryPayments, () =>
+        {
+            _salaryStore.SaveAccruals(_salaryAccruals);
+            _salaryStore.SavePayments(_salaryPayments);
+        }) { Owner = this };
+        window.ShowDialog();
+        _ = LoadAsync("Salaries");
+    }
+
     private void AddSalaryAccrual()
     {
         var employees = _salaryAccruals.Select(x => x.Employee).Concat(_salaryPayments.Select(x => x.Employee));
@@ -1933,8 +1977,6 @@ public partial class MainWindow : Window
         if (window.ShowDialog() != true || window.Result is null) return;
         _salaryPayments.Add(window.Result);
         _salaryStore.SavePayments(_salaryPayments);
-        _completedPayments.Add(new CompletedPayment($"Աշխատավարձ — {window.Result.Employee}", window.Result.Amount, window.Result.PaidDate, $"Շաբաթ՝ {window.Result.WeekStart:dd.MM.yyyy}; {window.Result.Note}"));
-        _completedPaymentStore.Save(_completedPayments);
         _ = LoadAsync("Salaries");
     }
 
