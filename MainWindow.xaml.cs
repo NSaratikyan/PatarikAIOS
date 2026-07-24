@@ -879,7 +879,8 @@ public partial class MainWindow : Window
     {
         var snapshot = await App.Services.DataProvider.GetSnapshotAsync(date);
         snapshot = MergeImportedSuppliers(snapshot);
-        return await ApplyAvailableFundsAsync(snapshot);
+        snapshot = await ApplyAvailableFundsAsync(snapshot);
+        return DecisionEngine.Evaluate(snapshot, PlannedSuppliersFor(date), _requiredPayments);
     }
 
     private async Task SendTelegramDashboardAsync(TelegramBotSettings settings, DateOnly date)
@@ -1345,6 +1346,7 @@ public partial class MainWindow : Window
                 "ՀԾ API տվյալների բեռնում", MessageBoxButton.OK, MessageBoxImage.Warning);
         }
         _snapshot = await ApplyAvailableFundsAsync(MergeImportedSuppliers(_snapshot));
+        _snapshot = DecisionEngine.Evaluate(_snapshot, PlanForSelectedDate(), _requiredPayments);
         MergeApiSupplierMovements(_snapshot);
         SubtitleText.Text = $"{_snapshot.Date:dd.MM.yyyy} · Որոշումները պահանջում են ձեր հաստատումը";
         PageHost.Content = page switch
@@ -1609,6 +1611,7 @@ public partial class MainWindow : Window
     {
         _snapshot = await App.Services.DataProvider.GetSnapshotAsync(_selectedDate);
         _snapshot = await ApplyAvailableFundsAsync(MergeImportedSuppliers(_snapshot));
+        _snapshot = DecisionEngine.Evaluate(_snapshot, PlanForSelectedDate(), _requiredPayments);
         MergeApiSupplierMovements(_snapshot);
         foreach (var change in _manualPaymentChanges) _snapshot = ApplyPaymentChange(_snapshot, change);
         await LoadAsync(_currentPage);
