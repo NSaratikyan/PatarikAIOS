@@ -909,6 +909,10 @@ public partial class MainWindow : Window
             _requiredPayments.Where(x => RequiredPaymentRules.AppliesOn(x, date)).Sum(x => x.Amount) +
             _manualPaymentChanges.Where(x => x.PlannedDate == date).Sum(x => x.Amount);
         var critical = snapshot.Recommendations.Where(x => x.Severity == Severity.Critical).ToList();
+        var unplannedReceipts = snapshot.SupplierMovements
+            .Where(x => x.Date == date && x.OrderAmount > 0m && !suppliers.Any(plan => SupplierNamesMatch(plan.Supplier, x.Supplier)))
+            .OrderBy(x => x.Supplier)
+            .ToList();
 
         var message = new System.Text.StringBuilder();
         message.AppendLine($"📊 Գլխավոր էջ — {date:dd.MM.yyyy}");
@@ -921,6 +925,13 @@ public partial class MainWindow : Window
         message.AppendLine($"Կտրոններ՝ {snapshot.Sales.ReceiptCount:N0} · Միջին չեկ՝ {snapshot.Sales.AverageReceipt:N0} ֏");
         message.AppendLine($"Կրիտիկական ռիսկեր՝ {critical.Count}");
         foreach (var risk in critical.Take(3)) message.AppendLine($"• {risk.Title}");
+        if (unplannedReceipts.Count > 0)
+        {
+            message.AppendLine();
+            message.AppendLine("⚠ Չպլանավորված մատակարարումներ");
+            foreach (var receipt in unplannedReceipts)
+                message.AppendLine($"• {receipt.Supplier} — ստացում՝ {receipt.OrderAmount:N0} ֏");
+        }
         message.AppendLine();
         message.AppendLine("Առավոտյան գործողությունների ցանկի համար գրեք՝ առավոտ");
         var dateCode = date.ToString("yyyy-MM-dd");
