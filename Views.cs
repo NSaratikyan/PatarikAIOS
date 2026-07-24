@@ -211,27 +211,26 @@ public static class Views
         // The owner sees the selected day's two payment groups instead.
         root.Children.Add(Card(daySummary));
 
-        root.Children.Add(Text("Պարտադիր վճարների բազա", 16, FontWeights.SemiBold, BrushFor("#0F766E")));
         var requiredGrid = NewGrid("Կատեգորիա", "Անվանում / ստացող", "Գումար", "Վճարման օր", "Կրկնում", "Նշում", "");
         foreach (var item in requiredPayments.Where(x => !isPast && x.IsActive && RequiredPaymentRules.AppliesOn(x, s.Date)).OrderBy(x => x.PaymentDay))
             AddRequiredPaymentRow(requiredGrid, item, editPayment, deletePayment);
         if (requiredPayments.All(x => !x.IsActive || !RequiredPaymentRules.AppliesOn(x, s.Date)))
             AddRow(requiredGrid, "—", "Այս օրվա համար պարտադիր վճարում չկա", "", "", "", "", "");
-        root.Children.Add(Card(requiredGrid));
+        root.Children.Add(CollapsibleSection("Պարտադիր վճարների բազա", Card(requiredGrid)));
 
-        root.Children.Add(Text("Ընտրված ամսվա պարտադիր վճարումների բազա", 16, FontWeights.SemiBold, BrushFor("#0F766E")));
-        root.Children.Add(Text("Այստեղից կարող եք խմբագրել կամ հեռացնել ցանկացած վճարում՝ առանց այլ օր ընտրելու։", 12, null, BrushFor("#64748B")));
         var monthlyGrid = NewGrid("Կատեգորիա", "Անվանում / ստացող", "Գումար", "Վճարման օր", "Կրկնում", "Նշում", "");
         var monthItems = requiredPayments.Where(x => RequiredPaymentRules.AppliesInMonth(x, s.Date)).OrderBy(x => x.PaymentDay).ThenBy(x => x.Name).ToList();
         foreach (var item in monthItems) AddRequiredPaymentRow(monthlyGrid, item, editPayment, deletePayment);
         if (!monthItems.Any()) AddRow(monthlyGrid, "—", "Բազայում վճարում չկա", "", "", "", "", "");
-        root.Children.Add(Card(monthlyGrid));
+        var monthContent = new StackPanel();
+        monthContent.Children.Add(Text("Այստեղից կարող եք խմբագրել կամ հեռացնել ցանկացած վճարում՝ առանց այլ օր ընտրելու։", 12, null, BrushFor("#64748B")));
+        monthContent.Children.Add(Card(monthlyGrid));
+        root.Children.Add(CollapsibleSection("Ընտրված ամսվա պարտադիր վճարումների բազա", monthContent));
 
-        root.Children.Add(Text("Ամսական վճարումների գրաֆիկ", 16, FontWeights.SemiBold, BrushFor("#0F766E")));
         var scheduleGrid = NewGrid("Վճարման օր", "Վճարումներ", "Ընդհանուր գումար");
         foreach (var group in requiredPayments.Where(x => !isPast && RequiredPaymentRules.AppliesOn(x, s.Date)).GroupBy(x => x.PaymentDay).OrderBy(x => x.Key))
             AddRow(scheduleGrid, group.Key.ToString(), string.Join(", ", group.Select(x => x.Name)), A(group.Sum(x => x.Amount)));
-        root.Children.Add(Card(scheduleGrid));
+        root.Children.Add(CollapsibleSection("Ամսական վճարումների գրաֆիկ", Card(scheduleGrid)));
         return new ScrollViewer { Content = root };
     }
 
@@ -429,6 +428,15 @@ public static class Views
         AddRow(grid, A(sales.SalesAmount), A(sales.CostAmount), A(sales.Profit), sales.ReceiptCount.ToString("N0"), A(sales.AverageReceipt), changes);
         return Card(new StackPanel { Children = { Text("📈 Վաճառքի ամփոփում", 16, FontWeights.SemiBold), Text("Այսօրվա ցուցանիշները՝ նախորդ օրվա համեմատ", 12, null, BrushFor("#64748B")), grid } });
     }
+    private static Expander CollapsibleSection(string title, UIElement content) => new()
+    {
+        Header = Text($"⌄ {title}", 16, FontWeights.SemiBold, BrushFor("#0F766E")),
+        Content = content,
+        IsExpanded = false,
+        Margin = new Thickness(0, 12, 0, 0),
+        Padding = new Thickness(4)
+    };
+
     private static Expander PaymentGroupExpander(string title, decimal amount, UIElement details)
     {
         var header = new DockPanel { LastChildFill = false, Margin = new Thickness(0, 4, 0, 4) };
