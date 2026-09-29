@@ -1,3 +1,5 @@
+using System.Windows;
+
 namespace PatarikAIOS;
 
 public partial class MainWindow
