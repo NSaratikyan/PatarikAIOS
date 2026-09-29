@@ -15,6 +15,7 @@
         <Button Content="📅  Վճարումների պլան" Tag="Payments" Click="Navigate_Click" HorizontalContentAlignment="Left"/>
         <Button Content="✅  Հաստատումներ" Tag="Approvals" Click="Navigate_Click" HorizontalContentAlignment="Left"/>
         <Button Content="🤖  AI առաջարկներ" Tag="Recommendations" Click="Navigate_Click" HorizontalContentAlignment="Left"/>
+        <Button Content="🧠  AI Manager" Click="OpenAiManager_Click" HorizontalContentAlignment="Left" Background="#1D4ED8" Foreground="White" Margin="0,8,0,0"/>
         <Button x:Name="CashImportButton" Content="Ներմուծել դրամարկղային ֆայլ" Click="ImportCashDocument_Click" HorizontalContentAlignment="Left" Background="#0F766E" Foreground="White" Margin="0,16,0,0"/>
         <Button Content="📊  Ամփոփում" Tag="Summary" Click="Navigate_Click" HorizontalContentAlignment="Left"/>
         <Button x:Name="CashAdjustmentButton" Content="✎  Դրամարկղի ուղղում" Click="AddCashDeskAdjustment_Click" HorizontalContentAlignment="Left"/>
