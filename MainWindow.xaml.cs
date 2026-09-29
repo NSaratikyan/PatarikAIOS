@@ -23,6 +23,8 @@ public partial class MainWindow : Window
     private readonly EmployeeSupplierActionStore _employeeSupplierActionStore = new();
     private readonly SupplierStatusChangeStore _supplierStatusChangeStore = new();
     private readonly EmployeePendingIssueStore _employeePendingIssueStore = new();
+    private readonly EmployeeSupplierSelectionStore _employeeSupplierSelectionStore = new();
+    private readonly SupplierNoteStore _supplierNoteStore = new();
     private readonly PendingEmployeeOrderChangeStore _pendingEmployeeOrderChangeStore = new();
     private readonly EmployeeTaskStore _employeeTaskStore = new();
     private readonly EmployeeTaskActionStore _employeeTaskActionStore = new();
@@ -33,6 +35,8 @@ public partial class MainWindow : Window
     private readonly AvailableFundsStore _availableFundsStore = new();
     private readonly CashDeskAdjustmentStore _cashDeskAdjustmentStore = new();
     private readonly LocalPurchaseProposalStore _purchaseProposalStore = new();
+    private readonly FundsTransactionStore _fundsTransactionStore = new();
+    private readonly SupplierDebtHistoryStore _supplierDebtHistoryStore = new();
     private readonly CashFlowPolicyStore _cashFlowPolicyStore = new();
     private readonly SalaryStore _salaryStore = new();
     private readonly PendingSalaryEmployeeStore _pendingSalaryEmployeeStore = new();
@@ -48,6 +52,8 @@ public partial class MainWindow : Window
     private readonly List<CashDocumentRecord> _cashDocuments;
     private AvailableFundsSettings _availableFunds;
     private readonly List<CashDeskAdjustment> _cashDeskAdjustments;
+    private readonly List<FundsTransaction> _fundsTransactions;
+    private readonly List<SupplierDebtChange> _supplierDebtHistory;
     private readonly List<SalaryAccrual> _salaryAccruals;
     private readonly List<SalaryPayment> _salaryPayments;
     private readonly List<PendingSalaryEmployee> _pendingSalaryEmployees;
@@ -58,7 +64,10 @@ public partial class MainWindow : Window
     private bool _employeeTelegramPollInProgress;
     private bool _employeeMorningScheduleInProgress;
     private bool _employeeTaskScheduleInProgress;
+    private bool _employeeNextDayScheduleInProgress;
+    private bool _employeeEveningScheduleInProgress;
     private bool _telegramScheduleInProgress;
+    private string? _cashSyncStatus;
     private DateOnly _selectedDate = DateOnly.FromDateTime(DateTime.Today);
     private SummaryPeriod _summaryPeriod = SummaryPeriod.Month;
     private bool _uiReady;
@@ -76,10 +85,13 @@ public partial class MainWindow : Window
         _cashDocuments = _cashDocumentStore.Load();
         _availableFunds = _availableFundsStore.Load();
         _cashDeskAdjustments = _cashDeskAdjustmentStore.Load();
+        _fundsTransactions = _fundsTransactionStore.Load();
+        _supplierDebtHistory = _supplierDebtHistoryStore.Load();
         _salaryAccruals = _salaryStore.LoadAccruals();
         _salaryPayments = _salaryStore.LoadPayments();
         _pendingSalaryEmployees = _pendingSalaryEmployeeStore.Load();
         InitializeComponent();
+        PresentationTheme.Apply(this);
         ViewDatePicker.SelectedDate = _selectedDate.ToDateTime(TimeOnly.MinValue);
         ConfigureDataProvider();
         Loaded += async (_, _) =>
@@ -99,6 +111,12 @@ public partial class MainWindow : Window
 
     private void ConfigureDataProvider()
     {
+        if (_excelImportStore.Load().Enabled)
+        {
+            App.Services.UseDataProvider(new ExcelDataProvider(_excelImportStore));
+            DataSourceStatusText.Text = "Տվյալների աղբյուր՝ ներմուծված Excel (ոչ առցանց)";
+            return;
+        }
         var settings = _htsApiSettingsStore.Load();
         if (settings.IsConfigured)
         {
@@ -110,13 +128,15 @@ public partial class MainWindow : Window
             App.Services.UseDataProvider(new EmptyDataProvider());
             DataSourceStatusText.Text = "Տվյալների աղբյուր՝ ՀԾ API-ն դեռ միացված չէ";
         }
+        _cashDocuments.Clear(); _cashDocuments.AddRange(_cashDocumentStore.Load());
+        _cashSyncStatus = null;
     }
 
     private void StartTelegramPolling()
     {
-        var settings = _telegramBotSettingsStore.Load();
-        if (!settings.IsConfigured || string.IsNullOrWhiteSpace(settings.ChatId)) return;
+        if (!((App)Application.Current).TryAcquireTelegramAutomationLease()) return;
 
+        // Keep checking settings even when the bot is connected after startup.
         _telegramPollTimer ??= new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromSeconds(25) };
         _telegramPollTimer.Tick -= TelegramPollTimer_Tick;
         _telegramPollTimer.Tick += TelegramPollTimer_Tick;
@@ -133,8 +153,7 @@ public partial class MainWindow : Window
 
     private void StartEmployeeTelegramPolling()
     {
-        var settings = _employeeTelegramBotSettingsStore.Load();
-        if (!settings.IsConfigured) return;
+        if (!((App)Application.Current).TryAcquireTelegramAutomationLease()) return;
         _employeeTelegramPollTimer ??= new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromSeconds(25) };
         _employeeTelegramPollTimer.Tick -= EmployeeTelegramPollTimer_Tick;
         _employeeTelegramPollTimer.Tick += EmployeeTelegramPollTimer_Tick;
@@ -165,7 +184,7 @@ public partial class MainWindow : Window
         try
         {
             foreach (var user in _employeeBotUserStore.Load())
-                await SendEmployeeOrderListAsync(settings, user.ChatId, today);
+                await TrySendEmployeeNotificationAsync($"Morning orders for {user.ChatId}", () => SendEmployeeOrderListAsync(settings, user.ChatId, today));
             var latest = _employeeTelegramBotSettingsStore.Load();
             _employeeTelegramBotSettingsStore.Save(latest with { LastMorningOrdersDate = today });
         }
@@ -176,10 +195,28 @@ public partial class MainWindow : Window
         finally { _employeeMorningScheduleInProgress = false; }
     }
 
-    private async Task SendEmployeeOrderListAsync(EmployeeTelegramBotSettings settings, string chatId, DateOnly date, string workflow = "receipt")
+    private async Task SendEmployeeOrderListAsync(EmployeeTelegramBotSettings settings, string chatId, DateOnly date, string workflow = "receipt", bool sendEmptyMessage = false)
     {
-        var rows = PlannedSuppliersFor(date).OrderBy(x => x.Supplier).ToList();
+        // Telegram is an action list, not a copy of the complete delivery calendar.
+        // Suppliers with no order, no payment and no reported exception remain visible
+        // in the Windows schedule, but they do not create unnecessary bot messages.
+        var rows = PlannedSuppliersFor(date)
+            .Where(row => HasTelegramSupplierAction(row, date))
+            .OrderBy(x => x.Supplier).ToList();
         var isOrdering = workflow == "order";
+        if (rows.Count == 0)
+        {
+            // Automatic reminders remain quiet when there is nothing to do,
+            // but a person who explicitly asks must always get an answer.
+            if (sendEmptyMessage)
+            {
+                var label = isOrdering ? "պատվեր" : "մատակարարական գործողություն";
+                await TelegramBotClient.SendMessageAsync(new TelegramBotSettings(settings.BotToken, chatId),
+                    $"ℹ️ {date:dd.MM.yyyy}-ի համար հաստատված {label} դեռ չկա։\n\n" +
+                    "Երբ տնօրենը կամ մենեջերը պլանավորի պատվեր/վճարում, այն այստեղ կերևա։");
+            }
+            return;
+        }
         var message = new System.Text.StringBuilder();
         message.AppendLine(isOrdering ? $"📝 ՊԱՏՎԻՐԵԼ — {date:dd.MM.yyyy}" : $"📦 ԸՆԹԱՑԻԿ ՊԱՏՎԵՐ — {date:dd.MM.yyyy}");
         message.AppendLine(isOrdering ? "Վաղվա/նշված օրվա նախնական պատվերներն են՝ մենեջերին գրանցելու համար։" : "Այսօրվա սպասվող ապրանքների ցանկն է։ ");
@@ -191,6 +228,10 @@ public partial class MainWindow : Window
             var row = rows[i];
             message.AppendLine($"{i + 1}. {row.Supplier}");
             message.AppendLine($"   Պատվեր՝ {row.OrderAmount:N0} ֏ | Նոր վճարում՝ {row.PaymentAmount:N0} ֏ | Հին վճարում՝ {row.OldDebtPayment:N0} ֏");
+            var latestNote = _supplierNoteStore.Load()
+                .Where(note => note.Date == date && SupplierNamesMatch(note.Supplier, row.Supplier))
+                .OrderByDescending(note => note.CreatedAt).FirstOrDefault();
+            if (latestNote is not null) message.AppendLine($"   📌 Նշում՝ {latestNote.Text}");
         }
         if (rows.Count == 0) message.AppendLine("Այս օրվա համար մատակարար չկա։");
         message.AppendLine("Ցանկը նորից ստանալու համար գրեք՝ պատվերներ");
@@ -204,6 +245,19 @@ public partial class MainWindow : Window
         await TelegramBotClient.SendMessageAsync(new TelegramBotSettings(settings.BotToken, chatId), message.ToString(), buttons);
     }
 
+    private bool HasTelegramSupplierAction(SupplierWeekPlanRow row, DateOnly date)
+    {
+        if (row.OrderAmount != 0m || row.PaymentAmount != 0m || row.OldDebtPayment != 0m)
+            return true;
+
+        // A receipt, non-arrival or employee problem must remain visible even
+        // if the financial amounts are zero.
+        return _employeeSupplierActionStore.Load().Any(action =>
+                   action.Date == date && SupplierNamesMatch(action.Supplier, row.Supplier))
+            || _supplierNoteStore.Load().Any(note =>
+                   note.Date == date && SupplierNamesMatch(note.Supplier, row.Supplier));
+    }
+
     private async Task TrySendEmployeeMorningTasksAsync()
     {
         if (_employeeTaskScheduleInProgress) return;
@@ -214,7 +268,7 @@ public partial class MainWindow : Window
         try
         {
             foreach (var user in _employeeBotUserStore.Load())
-                await SendEmployeeTasksAsync(settings, user.ChatId, today);
+                await TrySendEmployeeNotificationAsync($"Morning tasks for {user.ChatId}", () => SendEmployeeTasksAsync(settings, user.ChatId, today));
             var latest = _employeeTelegramBotSettingsStore.Load();
             _employeeTelegramBotSettingsStore.Save(latest with { LastMorningTasksDate = today });
         }
@@ -242,33 +296,51 @@ public partial class MainWindow : Window
 
     private async Task TrySendEmployeeNextDayOrdersAsync()
     {
+        if (_employeeNextDayScheduleInProgress) return;
         var settings = _employeeTelegramBotSettingsStore.Load();
         var today = DateOnly.FromDateTime(DateTime.Today);
         if (!settings.IsConfigured || settings.LastNextDayPlanDate == today || DateTime.Now.TimeOfDay < new TimeSpan(8, 10, 0)) return;
+        _employeeNextDayScheduleInProgress = true;
         try
         {
             foreach (var user in _employeeBotUserStore.Load())
-                await SendEmployeeOrderListAsync(settings, user.ChatId, today.AddDays(1), "order");
+                await TrySendEmployeeNotificationAsync($"Next day orders for {user.ChatId}", () => SendEmployeeOrderListAsync(settings, user.ChatId, today.AddDays(1), "order"));
             var latest = _employeeTelegramBotSettingsStore.Load();
             _employeeTelegramBotSettingsStore.Save(latest with { LastNextDayPlanDate = today });
         }
-        catch { }
+        catch (Exception exception) { RuntimeDiagnostics.Log("Next day employee orders", exception); }
+        finally { _employeeNextDayScheduleInProgress = false; }
     }
 
     private async Task TrySendEmployeeEveningReminderAsync()
     {
+        if (_employeeEveningScheduleInProgress) return;
         var settings = _employeeTelegramBotSettingsStore.Load();
         var today = DateOnly.FromDateTime(DateTime.Today);
         if (!settings.IsConfigured || settings.LastEveningReminderDate == today || DateTime.Now.TimeOfDay < new TimeSpan(20, 0, 0)) return;
+        _employeeEveningScheduleInProgress = true;
         try
         {
             const string reminder = "🔔 20:00 հիշեցում\n\nԽնդրում ենք ստուգել այսօրվա ստացումները և վաղվա պատվերները։ Նշեք՝ պատվերը գրվել է, մենեջերը չի եկել, թե խնդիր կա։\n\nԱյսօրվա համար՝ ընթացիկ պատվեր\nՎաղվա պատվերների համար՝ պատվիրել";
             foreach (var user in _employeeBotUserStore.Load())
-                await TelegramBotClient.SendMessageAsync(new TelegramBotSettings(settings.BotToken, user.ChatId), reminder);
+                await TrySendEmployeeNotificationAsync($"Evening reminder for {user.ChatId}", () => TelegramBotClient.SendMessageAsync(new TelegramBotSettings(settings.BotToken, user.ChatId), reminder));
             var latest = _employeeTelegramBotSettingsStore.Load();
             _employeeTelegramBotSettingsStore.Save(latest with { LastEveningReminderDate = today });
         }
-        catch { }
+        catch (Exception exception) { RuntimeDiagnostics.Log("Employee evening reminder", exception); }
+        finally { _employeeEveningScheduleInProgress = false; }
+    }
+
+    private static async Task TrySendEmployeeNotificationAsync(string operation, Func<Task> send)
+    {
+        try
+        {
+            await send();
+        }
+        catch (Exception exception)
+        {
+            RuntimeDiagnostics.Log(operation, exception);
+        }
     }
 
     private async Task ProcessEmployeeActionCallbackAsync(EmployeeTelegramBotSettings settings, EmployeeTelegramIncomingMessage message)
@@ -276,6 +348,41 @@ public partial class MainWindow : Window
         if (string.IsNullOrWhiteSpace(message.CallbackId)) return;
         await TelegramBotClient.AnswerCallbackAsync(new TelegramBotSettings(settings.BotToken, message.ChatId), message.CallbackId);
         var parts = message.Text.Split(':');
+        if (parts.Length == 2 && parts[0] == "empsel" && Guid.TryParse(parts[1], out var selectionId))
+        {
+            var selections = _employeeSupplierSelectionStore.Load();
+            var selection = selections.FirstOrDefault(x => x.Id == selectionId && x.ChatId == message.ChatId);
+            if (selection is null)
+            {
+                await TelegramBotClient.SendMessageAsync(new TelegramBotSettings(settings.BotToken, message.ChatId),
+                    "Այս ընտրությունը հնացել է։ Կրկին սեղմեք «Գործողություն» և ընտրեք մատակարարին։ ");
+                return;
+            }
+
+            // One button must be used only once. Old buttons therefore cannot
+            // accidentally update a different supplier after the plan changes.
+            selections.RemoveAll(x => x.Id == selectionId || x.CreatedAt < DateTime.Now.AddDays(-7));
+            _employeeSupplierSelectionStore.Save(selections);
+            var replySettings = new TelegramBotSettings(settings.BotToken, message.ChatId);
+            if (selection.Action is "issue" or "actual")
+            {
+                var pending = _employeePendingIssueStore.Load();
+                pending.RemoveAll(x => x.ChatId == message.ChatId);
+                pending.Add(new EmployeePendingIssue(message.ChatId, selection.Date, selection.Supplier, selection.Workflow, selection.Action));
+                _employeePendingIssueStore.Save(pending);
+                await TelegramBotClient.SendMessageAsync(replySettings, selection.Action == "actual"
+                    ? $"✏️ {selection.Supplier}\nԳրեք փաստացի թվերը այս ձևով՝ պատվեր/նոր վճարում/հին պարտքի վճարում\nՕրինակ՝ 5000/5000/2500"
+                    : $"⚠️ {selection.Supplier}\nՆկարագրեք խնդիրը մեկ հաղորդագրությամբ։ Օրինակ՝ «վճարում չի կատարվել», «ապրանքը հին էր», «մատակարարը ուշանալու է»։");
+                return;
+            }
+
+            var statusText = selection.Action == "done"
+                ? (selection.Workflow == "order" ? "Պատվերը գրանցվել է" : "Կատարված է")
+                : (selection.Workflow == "order" ? "Մենեջերը չի եկել / պատվերը չի գրվել" : "Չի եկել");
+            SaveEmployeeSupplierAction(selection.Date, selection.Supplier, statusText, string.Empty, message);
+            await TelegramBotClient.SendMessageAsync(replySettings, $"✅ Գրանցվեց՝ {selection.Supplier} — {statusText}։");
+            return;
+        }
         if (parts.Length == 2 && parts[0] == "emptaskmenu" &&
             DateOnly.TryParseExact(parts[1], "yyyyMMdd", System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out var taskDate))
         {
@@ -337,39 +444,47 @@ public partial class MainWindow : Window
         {
             var workflow = parts[1];
             var action = parts[2];
-            var rows = PlannedSuppliersFor(date).OrderBy(x => x.Supplier).ToList();
-            var buttons = rows.Select((row, index) => (IReadOnlyList<TelegramInlineButton>)new[]
+            // The inline button index must use exactly the same action-only
+            // collection that is later used to resolve empsup callbacks.
+            // Previously the menu showed all suppliers but the callback read
+            // from a filtered list, so some buttons selected another supplier
+            // or appeared to do nothing.
+            var rows = PlannedSuppliersFor(date)
+                .Where(row => HasTelegramSupplierAction(row, date))
+                .OrderBy(x => x.Supplier)
+                .ToList();
+            if (rows.Count == 0)
             {
-                new TelegramInlineButton(row.Supplier, $"empsup:{workflow}:{action}:{date:yyyyMMdd}:{index}")
-            }).ToList();
+                await TelegramBotClient.SendMessageAsync(new TelegramBotSettings(settings.BotToken, message.ChatId),
+                    "Այս օրվա համար գործողություն պահանջող մատակարար չկա։");
+                return;
+            }
+            var selections = _employeeSupplierSelectionStore.Load()
+                .Where(x => x.CreatedAt >= DateTime.Now.AddDays(-7)).ToList();
+            var buttons = new List<IReadOnlyList<TelegramInlineButton>>();
+            foreach (var row in rows)
+            {
+                var selection = new EmployeeSupplierSelection(Guid.NewGuid(), message.ChatId, date, row.Supplier, workflow, action, DateTime.Now);
+                selections.Add(selection);
+                buttons.Add(new[] { new TelegramInlineButton(row.Supplier, $"empsel:{selection.Id:N}") });
+            }
+            _employeeSupplierSelectionStore.Save(selections);
             var title = action == "done" ? "Կատարված" : action == "missing" ? "Չի եկել" : "Խնդիր";
             await TelegramBotClient.SendMessageAsync(new TelegramBotSettings(settings.BotToken, message.ChatId),
                 $"{title} — ընտրեք մատակարարին։", buttons);
             return;
         }
 
-        if (parts[0] != "empsup" || parts.Length != 5 || !int.TryParse(parts[4], out var index)) return;
-        var workflowForSupplier = parts[1];
-        var status = parts[2];
-        var suppliers = PlannedSuppliersFor(date).OrderBy(x => x.Supplier).ToList();
-        if (index < 0 || index >= suppliers.Count) return;
-        var supplier = suppliers[index].Supplier;
-        var replySettings = new TelegramBotSettings(settings.BotToken, message.ChatId);
-        if (status is "issue" or "actual")
+        // Legacy buttons from already-sent messages used a list index. They
+        // are intentionally rejected because that index may now refer to a
+        // different supplier. Employees should open a fresh action menu.
+        if (parts[0] == "empsup")
         {
-            var pending = _employeePendingIssueStore.Load();
-            pending.RemoveAll(x => x.ChatId == message.ChatId);
-            pending.Add(new EmployeePendingIssue(message.ChatId, date, supplier, workflowForSupplier, status));
-            _employeePendingIssueStore.Save(pending);
-            await TelegramBotClient.SendMessageAsync(replySettings, status == "actual"
-                ? $"✏️ {supplier}\nԳրեք փաստացի թվերը այս ձևով՝ պատվեր/նոր վճարում/հին պարտքի վճարում\nՕրինակ՝ 5000/5000/2500"
-                : $"⚠️ {supplier}\nՆկարագրեք խնդիրը մեկ հաղորդագրությամբ։ Օրինակ՝ «վճարում չի կատարվել», «ապրանքը հին էր», «մատակարարը ուշանալու է»։");
+            await TelegramBotClient.SendMessageAsync(new TelegramBotSettings(settings.BotToken, message.ChatId),
+                "Այս հին կոճակը անվտանգ չէ։ Կրկին սեղմեք «Գործողություն» և ընտրեք մատակարարին։ ");
             return;
         }
-
-        var statusText = status == "done" ? (workflowForSupplier == "order" ? "Պատվերը գրանցվել է" : "Կատարված է") : (workflowForSupplier == "order" ? "Մենեջերը չի եկել / պատվերը չի գրվել" : "Չի եկել");
-        SaveEmployeeSupplierAction(date, supplier, statusText, string.Empty, message);
-        await TelegramBotClient.SendMessageAsync(replySettings, $"✅ Գրանցվեց՝ {supplier} — {statusText}։");
+        return;
     }
 
     private async Task RegisterEmployeeActualOrderAsync(EmployeePendingIssue pending, EmployeeTelegramIncomingMessage message, TelegramBotSettings replySettings)
@@ -423,10 +538,19 @@ public partial class MainWindow : Window
             return;
         }
         var supplier = value[..lastSpace].Trim();
+        var canonical = ExactSupplier(supplier);
         var changes = _pendingEmployeeOrderChangeStore.Load();
-        changes.Add(new PendingEmployeeOrderChange(Guid.NewGuid(), date, supplier, 0m, 0m, order, payment, message.ChatId, message.DisplayName, DateTime.Now, 0m, oldDebtPayment));
+        var baseline = canonical is null ? null : PlannedSuppliersFor(date).FirstOrDefault(x => x.Supplier == canonical);
+        var change = new PendingEmployeeOrderChange(Guid.NewGuid(), date, canonical ?? supplier,
+            baseline?.OrderAmount ?? 0m, baseline?.PaymentAmount ?? 0m, order, payment, message.ChatId, message.DisplayName,
+            DateTime.Now, baseline?.OldDebtPayment ?? 0m, oldDebtPayment, canonical is null, supplier,
+            canonical is null ? SupplierNameSuggestions.Find(supplier, KnownSupplierNames()) : []);
+        changes.Add(change);
         _pendingEmployeeOrderChangeStore.Save(changes);
         await TelegramBotClient.SendMessageAsync(replySettings, $"⏳ Նոր մատակարարը գրանցվեց հաստատման համար։\n{date:dd.MM.yyyy} · {supplier}\n{order:N0}/{payment:N0}/{oldDebtPayment:N0}");
+        var owner = _telegramBotSettingsStore.Load();
+        if (owner.IsConfigured && !string.IsNullOrWhiteSpace(owner.ChatId))
+            await TrySendEmployeeNotificationAsync("Supplier review for director", () => SendPendingChangeAsync(owner, change));
     }
 
     private void SaveEmployeeSupplierAction(DateOnly date, string supplier, string status, string description, EmployeeTelegramIncomingMessage message)
@@ -469,6 +593,12 @@ public partial class MainWindow : Window
 
     private void ShowSupplierEmployeeStatus(string supplier)
     {
+        var debtChanges = _supplierDebtHistory
+            .Where(x => SupplierNamesMatch(x.Supplier, supplier))
+            .OrderByDescending(x => x.EffectiveDate)
+            .ThenByDescending(x => x.ChangedAt)
+            .Take(8)
+            .ToList();
         var actions = _employeeSupplierActionStore.Load()
             .Where(x => SupplierNamesMatch(x.Supplier, supplier))
             .OrderByDescending(x => x.Date)
@@ -478,18 +608,44 @@ public partial class MainWindow : Window
         if (today is not null)
         {
             var text = string.IsNullOrWhiteSpace(today.Description) ? today.Status : today.Description;
-            MessageBox.Show($"Մատակարար՝ {supplier}\nԱմսաթիվ՝ {_selectedDate:dd.MM.yyyy}\nԿարգավիճակ՝ {today.Status}\n\n{text}\n\nՆշել է՝ {today.ReportedByName} ({today.ReportedAt:HH:mm})", "Աշխատակցի նշում", MessageBoxButton.OK,
+            var debtText = debtChanges.Count == 0 ? string.Empty : "\n\nՊարտքի վերջին փոփոխություն՝ " +
+                $"{debtChanges[0].PreviousDebt:N0} ֏ → {debtChanges[0].NewDebt:N0} ֏ ({debtChanges[0].ChangedAt:dd.MM.yyyy HH:mm})";
+            MessageBox.Show($"Մատակարար՝ {supplier}\nԱմսաթիվ՝ {_selectedDate:dd.MM.yyyy}\nԿարգավիճակ՝ {today.Status}\n\n{text}{debtText}\n\nՆշել է՝ {today.ReportedByName} ({today.ReportedAt:HH:mm})", "Աշխատակցի նշում", MessageBoxButton.OK,
                 today.Status == "Խնդիր" ? MessageBoxImage.Warning : MessageBoxImage.Information);
             return;
         }
         var history = actions.Where(x => x.Status is "Խնդիր" or "Չի եկել").Take(8).ToList();
-        if (history.Count == 0)
+        if (history.Count == 0 && debtChanges.Count == 0)
         {
             MessageBox.Show($"{supplier}-ի համար {_selectedDate:dd.MM.yyyy}-ին աշխատակիցը դեռ նշում չի ուղարկել։", "Մատակարար", MessageBoxButton.OK, MessageBoxImage.Information);
             return;
         }
-        var lines = history.Select(x => $"{x.Date:dd.MM.yyyy} · {x.Status} · {(string.IsNullOrWhiteSpace(x.Description) ? "Առանց նկարագրության" : x.Description)}");
-        MessageBox.Show($"{supplier}\n\nԽնդիրների վերջին պատմությունը՝\n{string.Join("\n", lines)}", "Մատակարարի խնդիրների պատմություն", MessageBoxButton.OK, MessageBoxImage.Warning);
+        var lines = history.Select(x => $"{x.Date:dd.MM.yyyy} · {x.Status} · {(string.IsNullOrWhiteSpace(x.Description) ? "Առանց նկարագրության" : x.Description)}").ToList();
+        if (debtChanges.Count > 0)
+        {
+            lines.Add(string.Empty);
+            lines.Add("Պարտքի փոփոխությունների պատմություն՝");
+            lines.AddRange(debtChanges.Select(x => $"{x.EffectiveDate:dd.MM.yyyy} · {x.PreviousDebt:N0} ֏ → {x.NewDebt:N0} ֏ · {x.Reason}"));
+        }
+        MessageBox.Show($"{supplier}\n\n{string.Join("\n", lines)}", "Մատակարարի պատմություն", MessageBoxButton.OK, MessageBoxImage.Warning);
+    }
+
+    private void ShowSupplierDebtHistory(string supplier)
+    {
+        var history = _supplierDebtHistory
+            .Where(x => SupplierNamesMatch(x.Supplier, supplier))
+            .OrderByDescending(x => x.EffectiveDate)
+            .ThenByDescending(x => x.ChangedAt)
+            .ToList();
+        if (history.Count == 0)
+        {
+            MessageBox.Show($"{supplier}-ի համար դեռ պարտքի փոփոխություն չի գրանցվել։\n\nՊարտքի թիվը փոխեք և սեղմեք «Պահպանել»։", "Պարտքի պատմություն", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        var lines = history.Select(x =>
+            $"{x.EffectiveDate:dd.MM.yyyy} · {x.ChangedAt:HH:mm}\n{x.PreviousDebt:N0} ֏ → {x.NewDebt:N0} ֏\n{x.Reason}");
+        MessageBox.Show($"Մատակարար՝ {supplier}\n\n{string.Join("\n\n", lines)}", "Պարտքի փոփոխությունների պատմություն", MessageBoxButton.OK, MessageBoxImage.Information);
     }
 
     private async void EditSupplierStatus(SupplierWeekPlanRow row, EmployeeSupplierAction? currentAction)
@@ -501,7 +657,164 @@ public partial class MainWindow : Window
         var history = _supplierStatusChangeStore.Load();
         history.Add(window.Result);
         _supplierStatusChangeStore.Save(history);
-        await LoadAsync("Suppliers");
+        await LoadAsync(_currentPage == "PurchasePlan" ? "PurchasePlan" : "Suppliers");
+    }
+
+    private async void AddSupplierNoteFromDesktop(SupplierWeekPlanRow row)
+    {
+        var window = new SupplierNoteWindow(row.Date, row.Supplier) { Owner = this };
+        if (window.ShowDialog() != true || string.IsNullOrWhiteSpace(window.Result)) return;
+
+        var note = new SupplierNote(Guid.NewGuid(), row.Date, row.Supplier, window.Result, "Տնօրեն", true, DateTime.Now);
+        var notes = _supplierNoteStore.Load();
+        notes.Add(note);
+        _supplierNoteStore.Save(notes);
+        await NotifyEmployeesOfDirectorNoteAsync(note);
+        await LoadAsync(_currentPage == "PurchasePlan" ? "PurchasePlan" : "Suppliers");
+    }
+
+    private void ShowSupplierAnalysis(SupplierWeekPlanRow row)
+    {
+        var start = new DateOnly(_selectedDate.Year, _selectedDate.Month, 1);
+        var window = new SupplierAnalysisWindow(row.Supplier, start, _selectedDate,
+            (from, to) => LoadSupplierAnalysisAsync(row.Supplier, from, to)) { Owner = this };
+        window.ShowDialog();
+    }
+
+    private async Task<SupplierAnalysisData> LoadSupplierAnalysisAsync(string supplier, DateOnly startDate, DateOnly endDate)
+    {
+        IReadOnlyList<SupplierActivityLine> activity = [];
+        var fromHts = false;
+        var warnings = new List<string>();
+        if (App.Services.DataProvider is ISupplierActivityProvider activityProvider)
+        {
+            try
+            {
+                activity = await activityProvider.GetSupplierActivityAsync(supplier, startDate, endDate);
+                fromHts = App.Services.DataProvider is not EmptyDataProvider;
+            }
+            catch (Exception ex) { warnings.Add("Ստացումներ/վճարումներ՝ " + ex.Message); }
+        }
+
+        // The app remains useful before the API returns document history: show
+        // confirmed/manual plan entries instead of inventing figures.
+        if (!fromHts)
+        {
+            activity = _supplierWeekRows
+                .Where(row => row.Date >= startDate && row.Date <= endDate && SupplierNamesMatch(row.Supplier, supplier))
+                .Where(row => IsSupplierReceiptConfirmed(row, _employeeSupplierActionStore.Load(), _supplierStatusChangeStore.Load()))
+                .GroupBy(row => row.Date)
+                .Select(group => new SupplierActivityLine(group.Key,
+                    group.Sum(row => row.OrderAmount),
+                    group.Sum(row => row.PaymentAmount),
+                    group.Sum(row => row.OldDebtPayment),
+                    "Ծրագրի պլան", "Ծրագրում գրանցված պատվեր/վճարում"))
+                .OrderBy(line => line.Date)
+                .ToList();
+        }
+
+        SupplierSalesAnalysis? sales = null;
+        if (App.Services.DataProvider is ISupplierSalesAnalysisProvider salesProvider)
+        {
+            try
+            {
+                var allSales = await salesProvider.GetSupplierSalesAnalysisAsync(startDate, endDate);
+                sales = allSales.FirstOrDefault(item => SupplierNamesMatch(item.Supplier, supplier));
+                if (sales is null) warnings.Add("Մատակարարին կապակցված վաճառքի տողեր չկան։ Ստուգեք ՀԾ-ի խմբաքանակի մատակարարը։ Սա չի նշանակում զրոյական վաճառք։");
+            }
+            catch (Exception ex) { warnings.Add("Վաճառքներ՝ " + ex.Message); }
+        }
+
+        var apiDebt = _snapshot?.Suppliers.FirstOrDefault(item => SupplierNamesMatch(item.Name, supplier))?.Debt;
+        var importedDebt = _partnerDebts.Where(item => SupplierNamesMatch(item.Supplier, supplier)).OrderByDescending(item => item.AsOfDate).FirstOrDefault()?.Amount;
+        var plannedDebt = PlanForSelectedDate().Where(item => SupplierNamesMatch(item.Supplier, supplier)).Select(item => item.Debt).FirstOrDefault();
+        var currentDebt = apiDebt ?? importedDebt ?? plannedDebt;
+        return new SupplierAnalysisData(supplier, startDate, endDate, currentDebt, activity, sales, fromHts, string.Join("\n", warnings));
+    }
+
+    private async Task NotifyEmployeesOfDirectorNoteAsync(SupplierNote note)
+    {
+        var employeeSettings = _employeeTelegramBotSettingsStore.Load();
+        if (!employeeSettings.IsConfigured) return;
+
+        var text = $"📌 Տնօրենի նոր նշում\n\nՕր՝ {note.Date:dd.MM.yyyy}\nՄատակարար՝ {note.Supplier}\nՆշում՝ {note.Text}";
+        foreach (var chatId in _employeeBotUserStore.Load().Select(user => user.ChatId).Distinct())
+        {
+            try
+            {
+                await TelegramBotClient.SendMessageAsync(new TelegramBotSettings(employeeSettings.BotToken, chatId), text);
+            }
+            catch (Exception exception)
+            {
+                RuntimeDiagnostics.Log("Director supplier note notification", exception);
+            }
+        }
+    }
+
+    private static bool TryParseSupplierNote(string source, DateOnly defaultDate, out DateOnly date, out string supplier, out string text)
+    {
+        date = defaultDate;
+        supplier = string.Empty;
+        text = string.Empty;
+        var value = source.Trim().TrimStart('/');
+        if (!value.StartsWith("նշում", StringComparison.OrdinalIgnoreCase)) return false;
+        value = value["նշում".Length..].Trim();
+
+        if (TryTelegramDate(value, out var requestedDate))
+        {
+            date = requestedDate;
+            var match = System.Text.RegularExpressions.Regex.Match(value, @"\d{1,2}[,./-]\d{1,2}(?:[,./-]\d{2,4})?");
+            if (match.Success) value = value.Remove(match.Index, match.Length).Trim();
+        }
+
+        var separators = new[] { " - ", " — ", " – " };
+        var separator = separators.FirstOrDefault(value.Contains);
+        if (separator is null) return false;
+        var index = value.IndexOf(separator, StringComparison.Ordinal);
+        supplier = value[..index].Trim();
+        text = value[(index + separator.Length)..].Trim();
+        return !string.IsNullOrWhiteSpace(supplier) && !string.IsNullOrWhiteSpace(text);
+    }
+
+    private async Task RegisterSupplierNoteFromEmployeeAsync(EmployeeTelegramIncomingMessage message, TelegramBotSettings replySettings)
+    {
+        if (!TryParseSupplierNote(message.Text, DateOnly.FromDateTime(DateTime.Today), out var date, out var supplier, out var text))
+        {
+            await TelegramBotClient.SendMessageAsync(replySettings,
+                "Գրեք այս ձևով՝\nնշում 23.08.2026 Դավիդով - մենեջերը խնդրել է զանգել կեսօրից հետո");
+            return;
+        }
+
+        var note = new SupplierNote(Guid.NewGuid(), date, supplier, text, message.DisplayName, false, DateTime.Now);
+        var notes = _supplierNoteStore.Load();
+        notes.Add(note);
+        _supplierNoteStore.Save(notes);
+
+        var owner = _telegramBotSettingsStore.Load();
+        if (owner.IsConfigured && !string.IsNullOrWhiteSpace(owner.ChatId))
+            await TelegramBotClient.SendMessageAsync(owner,
+                $"📌 Աշխատակցի նշում\n\nՕր՝ {date:dd.MM.yyyy}\nՄատակարար՝ {supplier}\nՆշում՝ {text}\nԳրել է՝ {message.DisplayName}");
+
+        await TelegramBotClient.SendMessageAsync(replySettings, $"✅ Նշումը պահպանվեց՝ {date:dd.MM.yyyy} · {supplier}");
+        if (_currentPage == "Suppliers") await LoadAsync("Suppliers");
+    }
+
+    private async Task RegisterSupplierNoteFromOwnerTelegramAsync(TelegramBotSettings settings, string message)
+    {
+        if (!TryParseSupplierNote(message, DateOnly.FromDateTime(DateTime.Today), out var date, out var supplier, out var text))
+        {
+            await TelegramBotClient.SendMessageAsync(settings,
+                "Գրեք այս ձևով՝\nնշում 23.08.2026 Դավիդով - զանգել, համաձայնեցնել փոխանցումը");
+            return;
+        }
+
+        var note = new SupplierNote(Guid.NewGuid(), date, supplier, text, "Տնօրեն", true, DateTime.Now);
+        var notes = _supplierNoteStore.Load();
+        notes.Add(note);
+        _supplierNoteStore.Save(notes);
+        await NotifyEmployeesOfDirectorNoteAsync(note);
+        await TelegramBotClient.SendMessageAsync(settings, $"✅ Նշումը պահպանվեց և ուղարկվեց աշխատակիցներին՝ {date:dd.MM.yyyy} · {supplier}");
+        if (_currentPage == "Suppliers") await LoadAsync("Suppliers");
     }
 
     private async Task ProcessEmployeeTelegramMessagesAsync()
@@ -517,6 +830,8 @@ public partial class MainWindow : Window
             var users = _employeeBotUserStore.Load();
             foreach (var message in messages)
             {
+                try
+                {
                 var userIndex = users.FindIndex(x => x.ChatId == message.ChatId);
                 var user = new EmployeeBotUser(message.ChatId, message.DisplayName, userIndex >= 0 ? users[userIndex].RegisteredAt : DateTime.Now, DateTime.Now);
                 if (userIndex >= 0) users[userIndex] = user; else users.Add(user);
@@ -526,25 +841,33 @@ public partial class MainWindow : Window
                 {
                     await ProcessEmployeeActionCallbackAsync(settings, message);
                 }
+                else if (message.Text.TrimStart('/').StartsWith("անկանխիկ", StringComparison.OrdinalIgnoreCase))
+                {
+                    await RegisterNonCashAsync(replySettings,message.Text,"employee-noncash-"+message.UpdateId,message.DisplayName);
+                }
                 else if (message.Text.StartsWith("աշխատավարձ", StringComparison.OrdinalIgnoreCase))
                 {
                     await RegisterSalaryFromEmployeeTelegramAsync(message, replySettings);
+                }
+                else if (message.Text.StartsWith("նշում", StringComparison.OrdinalIgnoreCase) || message.Text.StartsWith("/նշում", StringComparison.OrdinalIgnoreCase))
+                {
+                    await RegisterSupplierNoteFromEmployeeAsync(message, replySettings);
                 }
                 else if (message.Text.Equals("/start", StringComparison.OrdinalIgnoreCase))
                 {
                     await TelegramBotClient.SendMessageAsync(replySettings,
                         "✅ Դուք գրանցվել եք Patarik-ի աշխատակիցների բոտում։\n\nԱյսօրվա ստացումները՝ գրեք «ընթացիկ պատվեր»։\nՎաղվա պատվերը մենեջերին գրելու համար՝ գրեք «պատվիրել»։\nՕրինակ՝ «պատվիրել 29.07.2026»։");
-                    await SendEmployeeOrderListAsync(settings, message.ChatId, DateOnly.FromDateTime(DateTime.Today));
+                    await SendEmployeeOrderListAsync(settings, message.ChatId, DateOnly.FromDateTime(DateTime.Today), sendEmptyMessage: true);
                 }
                 else if (message.Text.StartsWith("ընթացիկ պատվեր", StringComparison.OrdinalIgnoreCase) || message.Text.StartsWith("/ընթացիկ պատվեր", StringComparison.OrdinalIgnoreCase) || message.Text.StartsWith("պատվերներ", StringComparison.OrdinalIgnoreCase) || message.Text.StartsWith("/պատվերներ", StringComparison.OrdinalIgnoreCase))
                 {
                     var date = TryTelegramDate(message.Text, out var requestedDate) ? requestedDate : DateOnly.FromDateTime(DateTime.Today);
-                    await SendEmployeeOrderListAsync(settings, message.ChatId, date);
+                    await SendEmployeeOrderListAsync(settings, message.ChatId, date, sendEmptyMessage: true);
                 }
                 else if (message.Text.StartsWith("պատվիրել", StringComparison.OrdinalIgnoreCase) || message.Text.StartsWith("/պատվիրել", StringComparison.OrdinalIgnoreCase))
                 {
                     var date = TryTelegramDate(message.Text, out var requestedDate) ? requestedDate : DateOnly.FromDateTime(DateTime.Today).AddDays(1);
-                    await SendEmployeeOrderListAsync(settings, message.ChatId, date, "order");
+                    await SendEmployeeOrderListAsync(settings, message.ChatId, date, "order", sendEmptyMessage: true);
                 }
                 else if (message.Text.StartsWith("ավելացնել մատակարար", StringComparison.OrdinalIgnoreCase) || message.Text.StartsWith("/ավելացնել մատակարար", StringComparison.OrdinalIgnoreCase))
                 {
@@ -599,15 +922,32 @@ public partial class MainWindow : Window
                     await TelegramBotClient.SendMessageAsync(replySettings,
                         "Պատվերների ցանկի համար գրեք՝ պատվերներ");
                 }
+                }
+                catch (Exception exception)
+                {
+                    // One inaccessible employee chat must never block every
+                    // other employee or leave the same update stuck forever.
+                    RuntimeDiagnostics.Log($"Employee Telegram message {message.UpdateId} for {message.ChatId}", exception);
+                }
+                finally
+                {
+                    MarkEmployeeUpdateProcessed(message.UpdateId);
+                }
             }
             _employeeBotUserStore.Save(users);
-            _employeeTelegramBotSettingsStore.Save(settings with { LastUpdateId = messages.Max(x => x.UpdateId) });
         }
-        catch
+        catch (Exception exception)
         {
-            // The employee bot will retry on the next polling cycle.
+            RuntimeDiagnostics.Log("Employee Telegram polling", exception);
         }
         finally { _employeeTelegramPollInProgress = false; }
+    }
+
+    private void MarkEmployeeUpdateProcessed(long updateId)
+    {
+        var current = _employeeTelegramBotSettingsStore.Load();
+        if (current.LastUpdateId is { } last && last >= updateId) return;
+        _employeeTelegramBotSettingsStore.Save(current with { LastUpdateId = updateId });
     }
 
     private async Task ProcessTelegramMessagesAsync()
@@ -622,14 +962,19 @@ public partial class MainWindow : Window
             var messages = await TelegramBotClient.GetNewMessagesAsync(settings);
             if (messages.Count == 0) return;
 
-            foreach (var message in messages)
+            await TelegramUpdateProcessor.ProcessAsync(messages, message => message.UpdateId, async message =>
             {
                 if (!string.IsNullOrWhiteSpace(message.CallbackId))
                 {
                     await TelegramBotClient.AnswerCallbackAsync(settings, message.CallbackId);
                     await ProcessTelegramButtonAsync(settings, message.Text);
-                    continue;
+                    return;
                 }
+                if (message.Text.TrimStart('/').StartsWith("անկանխիկ", StringComparison.OrdinalIgnoreCase))
+                {
+                    await RegisterNonCashAsync(settings,message.Text,"owner-noncash-"+message.UpdateId,"Տնօրեն · Telegram"); return;
+                }
+                if (await HandleSupplierCorrectionTextAsync(settings, message.Text)) return;
                 if (_ownerPendingEmployeeIssueReplyStore.Load().FirstOrDefault() is { } pendingReply)
                 {
                     var issues = _employeeIssueStore.Load();
@@ -644,18 +989,40 @@ public partial class MainWindow : Window
                             await TelegramBotClient.SendMessageAsync(new TelegramBotSettings(employeeSettings.BotToken, issue.ChatId), $"💬 Տնօրենի պատասխան\n\n{issue.DirectorResponse}");
                         await TelegramBotClient.SendMessageAsync(settings, "✅ Պատասխանը ուղարկվեց աշխատակցին։");
                     }
-                    continue;
+                    return;
                 }
                 var command = message.Text.Trim().ToLowerInvariant();
+                if (command.StartsWith("վճարում", StringComparison.OrdinalIgnoreCase) ||
+                    command.StartsWith("/վճարում", StringComparison.OrdinalIgnoreCase) ||
+                    LooksLikeTransferCommand(command))
+                {
+                    await RegisterFundsTransactionFromTelegramAsync(settings, message.Text.Trim());
+                    return;
+                }
                 if (command.StartsWith("աշխատավարձ", StringComparison.OrdinalIgnoreCase))
                 {
                     await RegisterSalaryFromTelegramAsync(settings, message.Text.Trim());
-                    continue;
+                    return;
+                }
+                if (command.StartsWith("նշում", StringComparison.OrdinalIgnoreCase) || command.StartsWith("/նշում", StringComparison.OrdinalIgnoreCase))
+                {
+                    await RegisterSupplierNoteFromOwnerTelegramAsync(settings, message.Text.Trim());
+                    return;
+                }
+                if (command.StartsWith("ընթացիկ վերլուծություն", StringComparison.OrdinalIgnoreCase) || command.StartsWith("/ընթացիկ վերլուծություն", StringComparison.OrdinalIgnoreCase))
+                {
+                    await SendTelegramCurrentDayAnalysisAsync(settings, TryTelegramDate(message.Text, out var currentAnalysisDate) ? currentAnalysisDate : DateOnly.FromDateTime(DateTime.Today));
+                    return;
+                }
+                if (command.StartsWith("ընթացիկ դրություն", StringComparison.OrdinalIgnoreCase) || command.StartsWith("/ընթացիկ դրություն", StringComparison.OrdinalIgnoreCase))
+                {
+                    await SendTelegramCurrentStatusAsync(settings, TryTelegramDate(message.Text, out var currentStatusDate) ? currentStatusDate : DateOnly.FromDateTime(DateTime.Today));
+                    return;
                 }
                 if (command.StartsWith("վերլուծություն", StringComparison.OrdinalIgnoreCase) || command.StartsWith("/վերլուծություն", StringComparison.OrdinalIgnoreCase))
                 {
                     await SendTelegramCashFlowOpinionAsync(settings, TryTelegramDate(message.Text, out var analysisDate) ? analysisDate : DateOnly.FromDateTime(DateTime.Today));
-                    continue;
+                    return;
                 }
                 if (command is "սկսել" or "/սկսել" or "/start")
                     await SendTelegramDraftAsync(settings);
@@ -672,7 +1039,7 @@ public partial class MainWindow : Window
                 else if (command.StartsWith("հաստատումներ", StringComparison.OrdinalIgnoreCase) || command.StartsWith("/հաստատումներ", StringComparison.OrdinalIgnoreCase))
                     await SendPendingConfirmationsAsync(settings);
                 else if (command.StartsWith("առաջադրանք", StringComparison.OrdinalIgnoreCase) || command.StartsWith("/առաջադրանք", StringComparison.OrdinalIgnoreCase))
-                    await AddEmployeeTaskFromTelegramAsync(settings, message.Text);
+                    await AddEmployeeTaskFromTelegramAsync(settings, message);
                 else if ((message.Text.Contains('/') || message.Text.Contains("հեռացնել", StringComparison.OrdinalIgnoreCase)) && await TryRegisterTelegramBatchAsync(settings, message.Text.Trim()))
                 {
                     // The revised plan is sent by TryRegisterTelegramBatchAsync.
@@ -691,30 +1058,228 @@ public partial class MainWindow : Window
                     await SendTelegramDraftAsync(settings);
                 else
                     await TelegramBotClient.SendMessageAsync(settings, "Գրեք «սկսել»՝ նախնական պլանը ստանալու համար, կամ «ավելացնել <մատակարարի անուն>»՝ նոր մատակարար ավելացնելու համար։");
-            }
-
-            var latestSettings = _telegramBotSettingsStore.Load();
-            _telegramBotSettingsStore.Save(latestSettings with { LastUpdateId = messages.Max(x => x.UpdateId) });
+            }, updateId =>
+            {
+                var current = _telegramBotSettingsStore.Load();
+                if (!TelegramBotIdentity.IsSameBot(current.BotToken, settings.BotToken)) return;
+                if (current.LastUpdateId is { } last && last >= updateId) return;
+                _telegramBotSettingsStore.Save(current with { LastUpdateId = updateId });
+            }, (message, exception) => RuntimeDiagnostics.Log($"Owner Telegram message {message.UpdateId}", exception));
         }
-        catch
+        catch (Exception exception)
         {
-            // A temporary Telegram outage must not interrupt the desktop application.
+            RuntimeDiagnostics.Log("Owner Telegram polling", exception);
         }
         finally { _telegramPollInProgress = false; }
     }
 
+    /// <summary>
+    /// Owner payment syntax:
+    /// վճարում բանկ 10500 Ապարան թան
+    /// վճարում դրամարկղ 0002 10000 կոմունալ
+    /// վճարում բանկ 100000 կանխիկացում դրամարկղ 0001
+    /// The first value always describes where the money left from.
+    /// </summary>
+    private async Task RegisterFundsTransactionFromTelegramAsync(TelegramBotSettings settings, string text)
+    {
+        if (!TryParseFundsTransaction(text, out var transaction, out var error))
+        {
+            await TelegramBotClient.SendMessageAsync(settings,
+                $"Չհասկացա վճարումը։ {error}\n\nՕրինակներ՝\n• վճարում բանկ 10500 Ապարան թան\n• վճարում դրամարկղ 0002 10000 կոմունալ\n• վճարում բանկ 100000 կանխիկացում դրամարկղ 0001");
+            return;
+        }
+
+        _fundsTransactions.Add(transaction);
+        _fundsTransactionStore.Save(_fundsTransactions);
+        if (TryGetSupplierPayment(transaction, out var supplier, out var isOldDebtPayment))
+            ApplyManualSupplierPayment(transaction, supplier, isOldDebtPayment);
+        if (_snapshot is not null) await LoadAsync(_currentPage);
+
+        var target = string.IsNullOrWhiteSpace(transaction.TargetCashDesk)
+            ? string.Empty
+            : $" → դրամարկղ {transaction.TargetCashDesk}";
+        await TelegramBotClient.SendMessageAsync(settings,
+            $"✅ Վճարումը գրանցվեց\nԱղբյուր՝ {FundsSourceLabel(transaction.Source)}{target}\nԳումար՝ {transaction.Amount:N0} ֏\nՆպատակ՝ {transaction.Purpose}");
+    }
+
+    private static bool TryParseFundsTransaction(string text, out FundsTransaction transaction, out string error)
+    {
+        transaction = default!;
+        error = string.Empty;
+        var value = text.Trim().TrimStart('/');
+        if (TryParseInternalTransfer(value, out transaction, out error)) return true;
+        if (value.StartsWith("վճարում", StringComparison.OrdinalIgnoreCase)) value = value["վճարում".Length..].Trim();
+        var tokens = value.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (tokens.Length < 3) { error = "Պետք է նշեք աղբյուրը, գումարը և նպատակը։"; return false; }
+
+        var source = string.Empty;
+        var index = 0;
+        if (tokens[0].Equals("բանկ", StringComparison.OrdinalIgnoreCase))
+        {
+            source = "bank"; index = 1;
+        }
+        else if (tokens[0].Equals("դրամարկղ", StringComparison.OrdinalIgnoreCase))
+        {
+            if (tokens.Length < 4) { error = "Դրամարկղի կոդը, գումարը և նպատակը պարտադիր են։"; return false; }
+            source = NormalizeCashDesk(tokens[1]); index = 2;
+        }
+        else { error = "Առաջին բառը պետք է լինի «բանկ» կամ «դրամարկղ»։"; return false; }
+
+        if (!decimal.TryParse(tokens[index].Replace(",", string.Empty), out var amount) || amount <= 0m)
+        {
+            error = "Գումարը ճիշտ ձևով նշեք։"; return false;
+        }
+        index++;
+        var tail = string.Join(' ', tokens[index..]);
+        string? targetCashDesk = null;
+        const string targetPrefix = "դրամարկղ ";
+        var targetIndex = tail.LastIndexOf(targetPrefix, StringComparison.OrdinalIgnoreCase);
+        if (source == "bank" && targetIndex >= 0)
+        {
+            var code = tail[(targetIndex + targetPrefix.Length)..].Trim();
+            targetCashDesk = NormalizeCashDesk(code);
+            tail = tail[..targetIndex].Trim();
+        }
+        if (string.IsNullOrWhiteSpace(tail)) { error = "Վճարման նպատակը նշեք։"; return false; }
+        var category = targetCashDesk is not null ? "Կանխիկացում" : InferPaymentCategory(tail);
+        transaction = new FundsTransaction(Guid.NewGuid(), DateOnly.FromDateTime(DateTime.Today), source, amount, tail, category, targetCashDesk, DateTime.Now);
+        return true;
+    }
+
+    private static bool LooksLikeTransferCommand(string command)
+    {
+        var tokens = command.TrimStart('/').Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return tokens.Length >= 4 && tokens[1].Equals("ելք", StringComparison.OrdinalIgnoreCase) &&
+               (tokens[0].Equals("բանկ", StringComparison.OrdinalIgnoreCase) || NormalizeCashDesk(tokens[0]) is "0001" or "0002");
+    }
+
+    /// <summary>
+    /// Standard transfer syntax: [source] ելք [amount] [target].
+    /// It is a single internal transfer, never an expense or income.
+    /// Examples: 0001 ելք 6500 0002; 0002 ելք 5800 0001; բանկ ելք 100000 0001.
+    /// </summary>
+    private static bool TryParseInternalTransfer(string value, out FundsTransaction transaction, out string error)
+    {
+        transaction = default!;
+        error = string.Empty;
+        var tokens = value.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (tokens.Length != 4 || !tokens[1].Equals("ելք", StringComparison.OrdinalIgnoreCase)) return false;
+
+        var source = tokens[0].Equals("բանկ", StringComparison.OrdinalIgnoreCase) ? "bank" : NormalizeCashDesk(tokens[0]);
+        var target = tokens[3].Equals("բանկ", StringComparison.OrdinalIgnoreCase) ? "bank" : NormalizeCashDesk(tokens[3]);
+        if (source is not ("bank" or "0001" or "0002") || target is not ("bank" or "0001" or "0002"))
+        {
+            error = "Աղբյուրը և նպատակակետը պետք է լինեն բանկ, 0001 կամ 0002։";
+            return false;
+        }
+        if (source == target)
+        {
+            error = "Փոխանցման աղբյուրը և նպատակակետը չեն կարող նույնը լինել։";
+            return false;
+        }
+        if (!decimal.TryParse(tokens[2].Replace(",", string.Empty), out var amount) || amount <= 0m)
+        {
+            error = "Գումարը ճիշտ նշեք։";
+            return false;
+        }
+
+        transaction = new FundsTransaction(Guid.NewGuid(), DateOnly.FromDateTime(DateTime.Today), source, amount,
+            $"Ներքին փոխանցում՝ {FundsSourceLabel(source)} → {FundsSourceLabel(target)}", "Ներքին փոխանցում", target, DateTime.Now);
+        return true;
+    }
+
+    private static string NormalizeCashDesk(string value)
+    {
+        var digits = new string(value.Where(char.IsDigit).ToArray());
+        return digits switch { "1" or "01" or "001" or "0001" => "0001", "2" or "02" or "002" or "0002" => "0002", _ => digits.PadLeft(4, '0') };
+    }
+
+    private static string InferPaymentCategory(string purpose)
+    {
+        if (purpose.StartsWith("մատակարար ", StringComparison.OrdinalIgnoreCase)) return "Մատակարարի վճարում";
+        if (purpose.Contains("կոմունալ", StringComparison.OrdinalIgnoreCase)) return "Կոմունալ";
+        if (purpose.Contains("աշխատավարձ", StringComparison.OrdinalIgnoreCase)) return "Աշխատավարձ";
+        if (purpose.Contains("վարձ", StringComparison.OrdinalIgnoreCase)) return "Վարձավճար";
+        return "Այլ վճարում";
+    }
+
+    private static string FundsSourceLabel(string source) => source == "bank" ? "Բանկ" : $"Դրամարկղ {source}";
+
+    /// <summary>
+    /// Direct supplier-payment format for a manually selected cash desk:
+    /// վճարում դրամարկղ 0002 12000 մատակարար Չինար հին
+    /// վճարում դրամարկղ 0002 12000 մատակարար Չինար նոր
+    /// The final word is optional; without it, the amount is recorded as a
+    /// new-order payment.
+    /// </summary>
+    private static bool TryGetSupplierPayment(FundsTransaction transaction, out string supplier, out bool isOldDebtPayment)
+    {
+        supplier = string.Empty;
+        isOldDebtPayment = false;
+        const string prefix = "մատակարար ";
+        if (!transaction.Purpose.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return false;
+        var value = transaction.Purpose[prefix.Length..].Trim();
+        if (value.EndsWith(" հին", StringComparison.OrdinalIgnoreCase))
+        {
+            isOldDebtPayment = true;
+            value = value[..^" հին".Length].Trim();
+        }
+        else if (value.EndsWith(" նոր", StringComparison.OrdinalIgnoreCase))
+            value = value[..^" նոր".Length].Trim();
+        if (string.IsNullOrWhiteSpace(value)) return false;
+        supplier = value;
+        return true;
+    }
+
+    private void ApplyManualSupplierPayment(FundsTransaction transaction, string supplier, bool isOldDebtPayment)
+    {
+        var index = _supplierWeekRows.FindIndex(x => x.Date == transaction.Date && SupplierNamesMatch(x.Supplier, supplier));
+        var openingDebt = index >= 0
+            ? (_supplierWeekRows[index].Debt != 0m ? _supplierWeekRows[index].Debt : DebtBeforeDate(supplier, transaction.Date))
+            : DebtBeforeDate(supplier, transaction.Date);
+        var closingDebt = Math.Max(0m, openingDebt - transaction.Amount);
+        if (index >= 0)
+        {
+            var row = _supplierWeekRows[index];
+            _supplierWeekRows[index] = row with
+            {
+                PaymentAmount = row.PaymentAmount + (isOldDebtPayment ? 0m : transaction.Amount),
+                OldDebtPayment = row.OldDebtPayment + (isOldDebtPayment ? transaction.Amount : 0m),
+                Debt = closingDebt
+            };
+        }
+        else
+        {
+            _supplierWeekRows.Add(new SupplierWeekPlanRow(transaction.Date, supplier,
+                0m, isOldDebtPayment ? 0m : transaction.Amount,
+                isOldDebtPayment ? transaction.Amount : 0m, closingDebt));
+        }
+        _supplierWeekPlanStore.Save(_supplierWeekRows);
+        _supplierDebtHistory.Add(new SupplierDebtChange(Guid.NewGuid(), transaction.Date, supplier,
+            openingDebt, closingDebt,
+            $"Ձեռքով գրանցված {(isOldDebtPayment ? "հին պարտքի" : "նոր պատվերի")} վճարում՝ {transaction.Amount:N0} ֏ ({FundsSourceLabel(transaction.Source)})",
+            DateTime.Now, "Տնօրեն"));
+        _supplierDebtHistoryStore.Save(_supplierDebtHistory);
+    }
+
     private async Task ProcessTelegramButtonAsync(TelegramBotSettings settings, string data)
     {
+        if (await HandleSupplierReviewButtonAsync(settings, data)) return;
+        if (data.StartsWith("empday:", StringComparison.Ordinal) && DateOnly.TryParseExact(data[7..], "yyyyMMdd", System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out var approvalDate))
+        {
+            var daily = _pendingEmployeeOrderChangeStore.Load().Where(x => x.Date == approvalDate && !x.RequiresSupplierReview).ToList();
+            foreach (var change in daily) await ApproveEmployeeOrderChangeAsync(settings, change.Id, announceToOwner: false);
+            await TelegramBotClient.SendMessageAsync(settings, $"✅ {approvalDate:dd.MM.yyyy}․ հաստատված է {daily.Count} փոփոխություն։ Անվան ճշտման սպասողները մնացել են առանձին։");
+            return;
+        }
         if (data.Equals("emporderapproveall", StringComparison.OrdinalIgnoreCase))
         {
-            var changes = _pendingEmployeeOrderChangeStore.Load().ToList();
-            if (changes.Count == 0) { await TelegramBotClient.SendMessageAsync(settings, "Հաստատման սպասող փոփոխություններ չկան։"); return; }
-            foreach (var change in changes) await ApproveEmployeeOrderChangeAsync(settings, change.Id, announceToOwner: false);
-            await TelegramBotClient.SendMessageAsync(settings, $"✅ Հաստատվեց բոլոր փոփոխությունները՝ {changes.Count} հատ։");
+            await SendPendingConfirmationsAsync(settings);
             return;
         }
         if (data.StartsWith("empissuereply:", StringComparison.OrdinalIgnoreCase) && Guid.TryParse(data["empissuereply:".Length..], out var issueId))
         {
+            var state = _operationsStateStore.Load(); state.PendingSupplierCorrection = null; _operationsStateStore.Save(state);
             var pending = _ownerPendingEmployeeIssueReplyStore.Load(); pending.Clear(); pending.Add(new OwnerPendingEmployeeIssueReply(issueId)); _ownerPendingEmployeeIssueReplyStore.Save(pending);
             await TelegramBotClient.SendMessageAsync(settings, "Գրեք աշխատակցին ուղարկվող պատասխանը մեկ հաղորդագրությամբ։");
             return;
@@ -746,6 +1311,15 @@ public partial class MainWindow : Window
             case "payments":
                 await SendTelegramPaymentsAsync(settings, date);
                 break;
+            case "currentanalysis":
+                await SendTelegramCurrentDayAnalysisAsync(settings, date);
+                break;
+            case "currentstatus":
+                await SendTelegramCurrentStatusAsync(settings, date);
+                break;
+            case "currentdetail":
+                await SendTelegramCurrentStatusDetailsAsync(settings, date);
+                break;
             case "form":
                 await TelegramBotClient.SendMessageAsync(settings,
                     $"Լրացրեք և ուղարկեք այս ձևը՝\n\nգրանցել\nամսաթիվ: {date:dd.MM.yyyy}\nմատակարար: \nպատվեր: \nվճարում: \nտեսակ: նոր");
@@ -764,15 +1338,31 @@ public partial class MainWindow : Window
         var changes = _pendingEmployeeOrderChangeStore.Load();
         var change = changes.FirstOrDefault(x => x.Id == changeId);
         if (change is null) { await TelegramBotClient.SendMessageAsync(ownerSettings, "Այս փոփոխությունն արդեն մշակված է կամ չի գտնվել։"); return; }
-        var index = _supplierWeekRows.FindIndex(x => x.Date == change.Date && SupplierNamesMatch(x.Supplier, change.Supplier));
+        if (change.RequiresSupplierReview)
+        {
+            if (announceToOwner) await SendSupplierReviewAsync(ownerSettings, change);
+            else MessageBox.Show("Նախ ճշտեք մատակարարի անունը։", "Հաստատում");
+            return;
+        }
+        var index = _supplierWeekRows.FindIndex(x => x.Date == change.Date && string.Equals(x.Supplier, change.Supplier, StringComparison.OrdinalIgnoreCase));
+        var debtBeforeApproval = index >= 0 ? _supplierWeekRows[index].Debt : DebtBeforeDate(change.Supplier, change.Date);
         if (index >= 0)
         {
             var source = _supplierWeekRows[index];
-            _supplierWeekRows[index] = source with { OrderAmount = change.ActualOrder, PaymentAmount = change.ActualPayment, OldDebtPayment = change.ActualOldDebtPayment };
+            _supplierWeekRows[index] = source with { OrderAmount = change.ActualOrder, PaymentAmount = change.ActualPayment, OldDebtPayment = change.ActualOldDebtPayment,
+                Debt = source.Debt + (change.ActualOrder - source.OrderAmount) - (change.ActualPayment - source.PaymentAmount) - (change.ActualOldDebtPayment - source.OldDebtPayment) };
         }
-        else _supplierWeekRows.Add(new SupplierWeekPlanRow(change.Date, change.Supplier, change.ActualOrder, change.ActualPayment, change.ActualOldDebtPayment, DebtBeforeDate(change.Supplier, change.Date)));
+        else _supplierWeekRows.Add(new SupplierWeekPlanRow(change.Date, change.Supplier, change.ActualOrder, change.ActualPayment, change.ActualOldDebtPayment,
+            DebtBeforeDate(change.Supplier, change.Date) + change.ActualOrder - change.ActualPayment - change.ActualOldDebtPayment));
         _supplierWeekPlanStore.Save(_supplierWeekRows);
         var actions = _employeeSupplierActionStore.Load();
+        var approvedDebt = _supplierWeekRows.First(x => x.Date == change.Date && string.Equals(x.Supplier, change.Supplier, StringComparison.OrdinalIgnoreCase)).Debt;
+        if (approvedDebt != debtBeforeApproval)
+        {
+            _supplierDebtHistory.Add(new SupplierDebtChange(Guid.NewGuid(), change.Date, change.Supplier,
+                debtBeforeApproval, approvedDebt, "Աշխատակցի փաստացի տվյալների հաստատում", DateTime.Now, "Տնօրեն"));
+            _supplierDebtHistoryStore.Save(_supplierDebtHistory);
+        }
         actions.Add(new EmployeeSupplierAction(change.Date, change.Supplier, "Կատարված է", $"Նախնական՝ {change.PlannedOrder:N0}/{change.PlannedPayment:N0}/{change.PlannedOldDebtPayment:N0}; փաստացի ստացվել է՝ {change.ActualOrder:N0}/{change.ActualPayment:N0}/{change.ActualOldDebtPayment:N0}", change.ReportedByChatId, change.ReportedByName, DateTime.Now));
         _employeeSupplierActionStore.Save(actions);
         changes.RemoveAll(x => x.Id == changeId); _pendingEmployeeOrderChangeStore.Save(changes);
@@ -780,7 +1370,7 @@ public partial class MainWindow : Window
             await TelegramBotClient.SendMessageAsync(ownerSettings, $"✅ Գրանցվեց՝ {change.Supplier}, {change.Date:dd.MM.yyyy}։");
         var employeeSettings = _employeeTelegramBotSettingsStore.Load();
         if (employeeSettings.IsConfigured)
-            await TelegramBotClient.SendMessageAsync(new TelegramBotSettings(employeeSettings.BotToken, change.ReportedByChatId), $"✅ Տնօրենը հաստատեց {change.Supplier}-ի պատվերի փոփոխությունը։");
+            await TrySendEmployeeNotificationAsync("Supplier approval", () => TelegramBotClient.SendMessageAsync(new TelegramBotSettings(employeeSettings.BotToken, change.ReportedByChatId), $"✅ Տնօրենը հաստատեց {change.Date:dd.MM.yyyy} · {change.Supplier}\nՊատվեր/վճարում/հին պարտքի վճարում՝ {change.ActualOrder:N0}/{change.ActualPayment:N0}/{change.ActualOldDebtPayment:N0}"));
         if (_currentPage is "Suppliers" or "Recommendations" or "Approvals") await LoadAsync(_currentPage);
     }
 
@@ -798,8 +1388,9 @@ public partial class MainWindow : Window
         if (_currentPage == "Approvals") await LoadAsync("Approvals");
     }
 
-    private async Task AddEmployeeTaskFromTelegramAsync(TelegramBotSettings settings, string message)
+    private async Task AddEmployeeTaskFromTelegramAsync(TelegramBotSettings settings, TelegramIncomingMessage incoming)
     {
+        var message = incoming.Text;
         if (!TryTelegramDate(message, out var date))
         {
             await TelegramBotClient.SendMessageAsync(settings, "Գրեք այս ձևով՝\nառաջադրանք 29.07.2026 - գնապիտակի ճշտում");
@@ -812,16 +1403,19 @@ public partial class MainWindow : Window
             return;
         }
         var description = message[(dash + 1)..].Trim();
-        var task = new EmployeeTask(Guid.NewGuid(), date, description, DateTime.Now);
-        var tasks = _employeeTaskStore.Load(); tasks.Add(task); _employeeTaskStore.Save(tasks);
-        await TelegramBotClient.SendMessageAsync(settings, $"✅ Առաջադրանքը ավելացվեց՝ {date:dd.MM.yyyy}\n{description}");
+        var (_, added) = _employeeTaskStore.AddFromTelegram(date, description,
+            TelegramBotIdentity.BotId(settings.BotToken), incoming.ChatId, incoming.UpdateId);
+        if (!added) return;
+        await TrySendEmployeeNotificationAsync("Director task confirmation", () =>
+            TelegramBotClient.SendMessageAsync(settings, $"✅ Առաջադրանքը ավելացվեց՝ {date:dd.MM.yyyy}\n{description}"));
 
         if (date == DateOnly.FromDateTime(DateTime.Today))
         {
             var employeeSettings = _employeeTelegramBotSettingsStore.Load();
             if (employeeSettings.IsConfigured)
                 foreach (var user in _employeeBotUserStore.Load())
-                    await TelegramBotClient.SendMessageAsync(new TelegramBotSettings(employeeSettings.BotToken, user.ChatId), $"📌 Դուք ստացել եք նոր առաջադրանք\n\n{description}\n\nՏեսնելու համար գրեք՝ առաջադրանք");
+                    await TrySendEmployeeNotificationAsync($"New task for {user.ChatId}", () =>
+                        TelegramBotClient.SendMessageAsync(new TelegramBotSettings(employeeSettings.BotToken, user.ChatId), $"📌 Դուք ստացել եք նոր առաջադրանք\n\n{description}\n\nՏեսնելու համար գրեք՝ առաջադրանք"));
         }
     }
 
@@ -833,41 +1427,82 @@ public partial class MainWindow : Window
             await TelegramBotClient.SendMessageAsync(settings, "✅ Հաստատման սպասող փոփոխություններ չկան։");
             return;
         }
-        var text = new System.Text.StringBuilder();
-        text.AppendLine($"🗂 Հաստատումների ցանկ — {changes.Count} հատ");
-        foreach (var change in changes)
+        foreach (var day in changes.GroupBy(x => x.Date))
         {
-            text.AppendLine();
-            text.AppendLine($"{change.Date:dd.MM.yyyy} · {change.Supplier}");
-            text.AppendLine($"Պլան՝ {change.PlannedOrder:N0}/{change.PlannedPayment:N0}/{change.PlannedOldDebtPayment:N0}");
-            text.AppendLine($"Փաստացի՝ {change.ActualOrder:N0}/{change.ActualPayment:N0}/{change.ActualOldDebtPayment:N0}");
-            text.AppendLine($"Աշխատակից՝ {change.ReportedByName}");
+            await TelegramBotClient.SendMessageAsync(settings, $"🗂 Հաստատումներ — {day.Key:dd.MM.yyyy} · {day.Count()} հատ",
+                [[new TelegramInlineButton("Հաստատել այս օրվա ճշտվածները", $"empday:{day.Key:yyyyMMdd}")]]);
+            foreach (var change in day) await SendPendingChangeAsync(settings, change);
         }
-        var buttons = new IReadOnlyList<TelegramInlineButton>[]
-        {
-            new[] { new TelegramInlineButton("✅ Հաստատել բոլորը", "emporderapproveall") }
-        };
-        await TelegramBotClient.SendMessageAsync(settings, text.ToString(), buttons);
     }
 
     private async Task SendEveningOperationsAsync(TelegramBotSettings settings, DateOnly date)
     {
-        var received = PlannedSuppliersFor(date).OrderBy(x => x.Supplier).ToList();
-        var tomorrow = PlannedSuppliersFor(date.AddDays(1)).OrderBy(x => x.Supplier).ToList();
+        var today = PlannedSuppliersFor(date).Where(row => HasTelegramSupplierAction(row, date)).OrderBy(x => x.Supplier).ToList();
+        var tomorrow = PlannedSuppliersFor(date.AddDays(1)).Where(row => HasTelegramSupplierAction(row, date.AddDays(1))).OrderBy(x => x.Supplier).ToList();
         var actions = _employeeSupplierActionStore.Load();
-        var confirmed = actions.Count(x => x.Date == date && x.Status == "Կատարված է");
-        var problems = actions.Count(x => x.Date == date && x.Status is "Խնդիր" or "Չի եկել");
-        var text = new System.Text.StringBuilder();
-        text.AppendLine($"🌙 Երեկոյան օպերացիոն ամփոփում — {date:dd.MM.yyyy}");
-        text.AppendLine();
-        text.AppendLine($"Այսօրվա մատակարարումներ՝ {received.Count}");
-        text.AppendLine($"Հաստատված ստացումներ՝ {confirmed}");
-        text.AppendLine($"Խնդիրներ / չեկած՝ {problems}");
-        text.AppendLine();
-        text.AppendLine($"Վաղվա մատակարարումներ — {date.AddDays(1):dd.MM.yyyy}");
-        foreach (var item in tomorrow) text.AppendLine($"• {item.Supplier} · պատվեր {item.OrderAmount:N0} ֏ · վճարում {item.PaymentAmount + item.OldDebtPayment:N0} ֏");
-        await TelegramBotClient.SendMessageAsync(settings, text.ToString());
-        await SendPendingConfirmationsAsync(settings);
+        var ownerChanges = _supplierStatusChangeStore.Load();
+        var currentActions = actions.Where(x => x.Date == date).GroupBy(x => NormalizeSupplierName(x.Supplier))
+            .Select(x => x.OrderByDescending(a => a.ReportedAt).First()).ToList();
+        var currentStatuses = currentActions.Select(x => new { x.Supplier, x.Status, x.Description, Time = x.ReportedAt })
+            .Concat(ownerChanges.Where(x => x.Date == date).Select(x => new { x.Supplier, Status = x.NewStatus, Description = x.Note ?? "", Time = x.ChangedAt }))
+            .GroupBy(x => NormalizeSupplierName(x.Supplier)).Select(x => x.OrderByDescending(a => a.Time).First()).ToList();
+
+        var text = new System.Text.StringBuilder($"🌙 Այսօրվա ամփոփում — {date:dd.MM.yyyy}\n");
+        foreach (var item in today)
+        {
+            var confirmed = IsSupplierReceiptConfirmed(item, actions, ownerChanges);
+            text.AppendLine($"• {item.Supplier} · պատվեր {item.OrderAmount:N0} ֏ · {(confirmed ? "վճարված" : "նախատեսված վճարում")} {item.PaymentAmount + item.OldDebtPayment:N0} ֏ · {(confirmed ? "հաստատված" : "չհաստատված")}");
+        }
+        if (today.Count == 0) text.AppendLine("Գործողություն պահանջող մատակարարում չկա։");
+        await SendDailySectionAsync(settings, date, "today", text.ToString());
+
+        if (tomorrow.Count > 0)
+        {
+            text = new System.Text.StringBuilder($"📅 Վաղվա պլան — {date.AddDays(1):dd.MM.yyyy}\n");
+            foreach (var item in tomorrow) text.AppendLine($"• {item.Supplier} · պատվեր {item.OrderAmount:N0} ֏ · նախատեսված վճարում {item.PaymentAmount + item.OldDebtPayment:N0} ֏");
+            await SendDailySectionAsync(settings, date, "tomorrow", text.ToString());
+        }
+
+        var absent = currentStatuses.Where(x => x.Status == "Չի եկել").ToList();
+        var pending = today.Where(x => !IsSupplierReceiptConfirmed(x, actions, ownerChanges) &&
+            !absent.Any(a => SupplierNamesMatch(a.Supplier, x.Supplier))).ToList();
+        if (absent.Count > 0 || pending.Count > 0)
+            await SendDailySectionAsync(settings, date, "absent",
+                $"🚚 Չեկած / չհաստատված — {date:dd.MM.yyyy}\n" +
+                string.Join("\n", absent.Select(x => $"• Չի եկել՝ {x.Supplier} · {x.Description}")) +
+                (pending.Count == 0 ? "" : "\nՍտացումը դեռ հաստատված չէ (չի նշանակում՝ չի եկել)․\n" + string.Join("\n", pending.Select(x => "• " + x.Supplier))));
+
+        var notes = _supplierNoteStore.Load().Where(x => x.Date == date).OrderBy(x => x.CreatedAt).ToList();
+        if (notes.Count > 0)
+            await SendDailySectionAsync(settings, date, "notes", $"📝 Նշումներ — {date:dd.MM.yyyy}\n" +
+                string.Join("\n", notes.Select(x => $"• {x.Supplier} · {x.Text} · {x.Author}")));
+
+        var issues = _employeeIssueStore.Load().Where(x => x.Date == date).ToList();
+        var supplierIssues = currentStatuses.Where(x => x.Status == "Խնդիր").ToList();
+        if (issues.Count > 0 || supplierIssues.Count > 0)
+            await SendDailySectionAsync(settings, date, "issues", $"⚠ Գրանցված խնդիրներ — {date:dd.MM.yyyy}\n" +
+                string.Join("\n", supplierIssues.Select(x => $"• {x.Supplier} · {x.Description}")
+                    .Concat(issues.Select(x => "• " + x.Description))));
+
+        foreach (var group in _pendingEmployeeOrderChangeStore.Load().GroupBy(x => x.Date).OrderBy(x => x.Key))
+        {
+            await SendDailySectionAsync(settings, date, $"pending-{group.Key:yyyyMMdd}",
+                $"⏳ Հաստատման սպասող — {group.Key:dd.MM.yyyy} · {group.Count()} փոփոխություն\nՄանրամասները և հաստատման կոճակները՝ «հաստատումներ» հրամանով։");
+        }
+    }
+
+    private async Task SendDailySectionAsync(TelegramBotSettings settings, DateOnly date, string section, string text)
+    {
+        var index = 0;
+        foreach (var part in TelegramTextSections.Split(text))
+        {
+            var key = $"{settings.BotToken.Split(':')[0]}:{settings.ChatId}:{date:yyyyMMdd}:{section}:{index++}";
+            if (_operationsStateStore.Load().DeliveredSections.Contains(key)) continue;
+            await TelegramBotClient.SendMessageAsync(settings, part);
+            var state = _operationsStateStore.Load();
+            state.DeliveredSections.Add(key);
+            _operationsStateStore.Save(state);
+        }
     }
 
     private async Task TrySendScheduledTelegramBriefsAsync()
@@ -884,26 +1519,31 @@ public partial class MainWindow : Window
             {
                 await SendTelegramMorningBriefAsync(settings, today);
                 settings = settings with { LastMorningBriefDate = today };
+                _telegramBotSettingsStore.Save(_telegramBotSettingsStore.Load() with { LastMorningBriefDate = today });
             }
             if (settings.LastEveningDashboardDate != today && now >= new TimeSpan(23, 30, 0))
             {
                 await SendTelegramDashboardAsync(settings, today);
                 settings = settings with { LastEveningDashboardDate = today };
+                _telegramBotSettingsStore.Save(_telegramBotSettingsStore.Load() with { LastEveningDashboardDate = today });
             }
             if (settings.LastCashFlowOpinionDate != today && now >= new TimeSpan(23, 40, 0))
             {
                 await SendTelegramCashFlowOpinionAsync(settings, today);
                 settings = settings with { LastCashFlowOpinionDate = today };
+                _telegramBotSettingsStore.Save(_telegramBotSettingsStore.Load() with { LastCashFlowOpinionDate = today });
             }
             if (settings.LastEveningOperationsDate != today && now >= new TimeSpan(21, 0, 0))
             {
                 await SendEveningOperationsAsync(settings, today);
                 settings = settings with { LastEveningOperationsDate = today };
+                _telegramBotSettingsStore.Save(_telegramBotSettingsStore.Load() with { LastEveningOperationsDate = today });
             }
             if (settings.LastDeliveryConfirmationDate != today && now >= new TimeSpan(22, 0, 0))
             {
                 await SendTelegramDraftAsync(settings, today.AddDays(2));
                 settings = settings with { LastDeliveryConfirmationDate = today };
+                _telegramBotSettingsStore.Save(_telegramBotSettingsStore.Load() with { LastDeliveryConfirmationDate = today });
             }
             var latestSettings = _telegramBotSettingsStore.Load();
             _telegramBotSettingsStore.Save(latestSettings with
@@ -924,6 +1564,7 @@ public partial class MainWindow : Window
 
     private async Task<DashboardSnapshot> TelegramSnapshotAsync(DateOnly date)
     {
+        await SyncCashDocumentsAsync(date);
         var snapshot = await App.Services.DataProvider.GetSnapshotAsync(date);
         snapshot = MergeImportedSuppliers(snapshot);
         snapshot = await ApplyAvailableFundsAsync(snapshot);
@@ -951,8 +1592,8 @@ public partial class MainWindow : Window
         message.AppendLine($"Հասանելի միջոցներ՝ {funds.Total:N0} ֏");
         message.AppendLine($"Կանխիկ՝ {funds.Cash:N0} ֏ · Բանկ՝ {funds.Bank:N0} ֏");
         message.AppendLine($"Այսօրվա վճարումներ՝ {plannedPayments:N0} ֏");
-        message.AppendLine($"Այսօրվա վաճառք՝ {snapshot.Sales.SalesAmount:N0} ֏");
-        message.AppendLine($"Շահույթ՝ {snapshot.Sales.Profit:N0} ֏");
+        message.AppendLine($"Այսօրվա վաճառք՝ {snapshot.Sales.SalesDisplay}");
+        message.AppendLine($"Շահույթ (վաճառք − ինքնարժեք)՝ {snapshot.Sales.ProfitDisplay}");
         message.AppendLine($"Կտրոններ՝ {snapshot.Sales.ReceiptCount:N0} · Միջին չեկ՝ {snapshot.Sales.AverageReceipt:N0} ֏");
         message.AppendLine($"Կրիտիկական ռիսկեր՝ {critical.Count}");
         foreach (var risk in critical.Take(3)) message.AppendLine($"• {risk.Title}");
@@ -969,16 +1610,22 @@ public partial class MainWindow : Window
         var buttons = new IReadOnlyList<TelegramInlineButton>[]
         {
             new[] { new TelegramInlineButton("📊 Գլխավոր", $"dashboard:{dateCode}"), new TelegramInlineButton("🌅 Առավոտ", $"morning:{dateCode}") },
-            new[] { new TelegramInlineButton("💳 Վճարումներ", $"payments:{dateCode}") }
+            new[] { new TelegramInlineButton("💳 Վճարումներ", $"payments:{dateCode}"), new TelegramInlineButton("📍 Ընթացիկ դրություն", $"currentstatus:{dateCode}") },
+            new[] { new TelegramInlineButton("📈 Խորը վերլուծություն", $"currentanalysis:{dateCode}") }
         };
         await TelegramBotClient.SendMessageAsync(settings, message.ToString(), buttons);
     }
 
     private async Task RegisterSalaryFromEmployeeTelegramAsync(EmployeeTelegramIncomingMessage message, TelegramBotSettings replySettings)
     {
+        if (SalaryTelegramParser.TryParseBatch(message.Text.Trim(), DateOnly.FromDateTime(DateTime.Today), out var batchDate, out var batchLines))
+        {
+            await RegisterSalaryBatchAsync(replySettings, batchDate, batchLines, message.DisplayName);
+            return;
+        }
         if (!SalaryTelegramParser.TryParse(message.Text.Trim(), DateOnly.FromDateTime(DateTime.Today), out var date, out var employee, out var amount, out var note))
         {
-            await TelegramBotClient.SendMessageAsync(replySettings, "Գրեք այս ձևով՝\nաշխատավարձ / Աշխատողի անուն / 12000 / նշում\nկամ՝\nաշխատավարձ / Աշխատողի անուն / 12000 / 17,07,2026");
+            await TelegramBotClient.SendMessageAsync(replySettings, "Գրեք այս ձևով՝\nաշխատավարձ / Աշխատողի անուն / 12000 / նշում\n\nԿամ մի քանի հոգու համար՝\nաշխատավարձ 02.09.2026\nԼուսինե / 8500\nՆարինե / 9000");
             return;
         }
         var knownEmployees = _salaryAccruals.Select(x => x.Employee).Concat(_salaryPayments.Select(x => x.Employee));
@@ -1004,9 +1651,14 @@ public partial class MainWindow : Window
 
     private async Task RegisterSalaryFromTelegramAsync(TelegramBotSettings settings, string message)
     {
+        if (SalaryTelegramParser.TryParseBatch(message, DateOnly.FromDateTime(DateTime.Today), out var batchDate, out var batchLines))
+        {
+            await RegisterSalaryBatchAsync(settings, batchDate, batchLines, "Տնօրեն");
+            return;
+        }
         if (!SalaryTelegramParser.TryParse(message, DateOnly.FromDateTime(DateTime.Today), out var date, out var employee, out var amount, out var note))
         {
-            await TelegramBotClient.SendMessageAsync(settings, "Չհաջողվեց կարդալ աշխատավարձի տվյալը։ Գրեք այս ձևով՝\n\nաշխատավարձ / Աշխատողի անուն / 12000 / նշում\n\nկամ՝\nաշխատավարձ 29.07.2026 / Աշխատողի անուն / 12000 / նշում");
+            await TelegramBotClient.SendMessageAsync(settings, "Չհաջողվեց կարդալ աշխատավարձի տվյալը։ Գրեք այս ձևով՝\n\nաշխատավարձ / Աշխատողի անուն / 12000 / նշում\n\nԿամ մի քանի հոգու համար՝\nաշխատավարձ 02.09.2026\nԼուսինե / 8500\nՆարինե / 9000");
             return;
         }
         var knownEmployees = _salaryAccruals.Select(x => x.Employee).Concat(_salaryPayments.Select(x => x.Employee));
@@ -1032,11 +1684,256 @@ public partial class MainWindow : Window
         if (_currentPage == "Salaries") await LoadAsync("Salaries");
     }
 
+    private async Task RegisterSalaryBatchAsync(TelegramBotSettings replySettings, DateOnly date, IReadOnlyList<SalaryBatchLine> lines, string reporter)
+    {
+        var knownEmployees = _salaryAccruals.Select(x => x.Employee).Concat(_salaryPayments.Select(x => x.Employee)).ToList();
+        var registered = new List<(string Employee, decimal Amount)>();
+        var pending = new List<(string Employee, decimal Amount)>();
+        var repeated = new List<string>();
+
+        foreach (var line in lines)
+        {
+            var matched = SalaryEmployeeMatcher.FindKnown(line.Employee, knownEmployees);
+            if (matched is null && knownEmployees.Any())
+            {
+                _pendingSalaryEmployees.Add(new PendingSalaryEmployee(Guid.NewGuid(), new SalaryAccrual(Guid.NewGuid(), date, line.Employee, line.Amount, line.Note, DateTime.Now), DateTime.Now));
+                pending.Add((line.Employee, line.Amount));
+                continue;
+            }
+
+            var employee = matched ?? line.Employee;
+            var previous = _salaryAccruals.Count(x => x.Date == date && string.Equals(x.Employee, employee, StringComparison.OrdinalIgnoreCase));
+            _salaryAccruals.Add(new SalaryAccrual(Guid.NewGuid(), date, employee, line.Amount, line.Note, DateTime.Now));
+            if (!knownEmployees.Contains(employee, StringComparer.OrdinalIgnoreCase)) knownEmployees.Add(employee);
+            registered.Add((employee, line.Amount));
+            if (previous > 0) repeated.Add(employee);
+        }
+
+        if (registered.Count > 0) _salaryStore.SaveAccruals(_salaryAccruals);
+        if (pending.Count > 0) _pendingSalaryEmployeeStore.Save(_pendingSalaryEmployees);
+
+        var text = new System.Text.StringBuilder();
+        text.AppendLine($"✅ Աշխատավարձերի ցանկ — {date:dd.MM.yyyy}");
+        foreach (var item in registered) text.AppendLine($"• {item.Employee} — {item.Amount:N0} ֏");
+        if (registered.Count > 0) text.AppendLine($"Ընդամենը գրանցվեց՝ {registered.Sum(x => x.Amount):N0} ֏");
+        if (pending.Count > 0)
+        {
+            text.AppendLine();
+            text.AppendLine("🟡 Տնօրենի հաստատման սպասող նոր աշխատողներ՝");
+            foreach (var item in pending) text.AppendLine($"• {item.Employee} — {item.Amount:N0} ֏");
+        }
+        if (repeated.Count > 0)
+            text.AppendLine($"⚠️ Կրկնվող գրառում՝ {string.Join(", ", repeated.Distinct(StringComparer.OrdinalIgnoreCase))}։ Ստուգեք «Աշխատավարձեր» բաժնից։");
+        await TelegramBotClient.SendMessageAsync(replySettings, text.ToString());
+
+        var owner = _telegramBotSettingsStore.Load();
+        if (pending.Count > 0 && owner.IsConfigured && !string.IsNullOrWhiteSpace(owner.ChatId) && owner.ChatId != replySettings.ChatId)
+        {
+            var pendingText = string.Join("\n", pending.Select(x => $"• {x.Employee} — {x.Amount:N0} ֏"));
+            await TelegramBotClient.SendMessageAsync(owner, $"🟡 {reporter}-ը ավելացրել է նոր աշխատողներ։\nՕր՝ {date:dd.MM.yyyy}\n{pendingText}\n\nՀաստատեք «Աշխատավարձեր» բաժնից։");
+        }
+        if (_currentPage == "Salaries") await LoadAsync("Salaries");
+    }
+
+    /// <summary>
+    /// A point-in-time view of the selected operational day.  Unlike the
+    /// seven-day opinion this uses today's actual sales and separates what is
+    /// completed from what remains actionable before the day is closed.
+    /// </summary>
+    private async Task SendTelegramCurrentDayAnalysisAsync(TelegramBotSettings settings, DateOnly date)
+    {
+        var snapshot = await TelegramSnapshotAsync(date);
+        var plan = PlannedSuppliersFor(date);
+        var employeeActions = _employeeSupplierActionStore.Load();
+        var ownerChanges = _supplierStatusChangeStore.Load();
+        var confirmed = plan.Where(x => IsSupplierReceiptConfirmed(x, employeeActions, ownerChanges)).ToList();
+        var pending = plan.Where(x => !IsSupplierReceiptConfirmed(x, employeeActions, ownerChanges))
+            .Where(x => x.OrderAmount != 0m || x.PaymentAmount != 0m || x.OldDebtPayment != 0m)
+            .ToList();
+
+        var plannedSupplierPayments = plan.Sum(x => x.PaymentAmount + x.OldDebtPayment);
+        // Prefer factual payment records. A confirmed supplier line is only a
+        // fallback when no actual payment has been registered for that supplier.
+        // This keeps partial payments and manually chosen 0002/bank payments
+        // correct in the point-in-time report.
+        var supplierNamesForDay = plan.Select(x => x.Supplier).ToList();
+        var actualSupplierPayments = AllActualPayments()
+            .Where(x => x.PaidDate == date)
+            .Where(x => supplierNamesForDay.Any(name => SupplierNamesMatch(name, x.Recipient)))
+            .ToList();
+        var confirmedFallback = confirmed
+            .Where(row => !actualSupplierPayments.Any(payment => SupplierNamesMatch(payment.Recipient, row.Supplier)))
+            .Sum(row => row.PaymentAmount + row.OldDebtPayment);
+        var completedSupplierPayments = actualSupplierPayments.Sum(x => x.Amount) + confirmedFallback;
+        var remainingSupplierPayments = plan.Sum(row =>
+        {
+            var factual = actualSupplierPayments
+                .Where(payment => SupplierNamesMatch(payment.Recipient, row.Supplier))
+                .Sum(payment => payment.Amount);
+            var fallback = factual == 0m && confirmed.Any(confirmedRow => SupplierNamesMatch(confirmedRow.Supplier, row.Supplier))
+                ? row.PaymentAmount + row.OldDebtPayment
+                : 0m;
+            return Math.Max(0m, row.PaymentAmount + row.OldDebtPayment - factual - fallback);
+        });
+        var plannedOther = _requiredPayments.Where(x => RequiredPaymentRules.AppliesOn(x, date)).Sum(x => x.Amount)
+            + _manualPaymentChanges.Where(x => x.PlannedDate == date).Sum(x => x.Amount)
+            + snapshot.Payments.Where(x => x.DueDate == date && !plan.Any(row => SupplierNamesMatch(row.Supplier, x.Supplier))).Sum(x => x.Amount)
+            + PlannedSundayPayroll(date);
+        var supplierNames = plan.Select(x => x.Supplier).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var completedOther = AllActualPayments()
+            .Where(x => x.PaidDate == date && !supplierNames.Contains(x.Recipient))
+            .Sum(x => x.Amount)
+            + _salaryPayments.Where(x => x.PaidDate == date).Sum(x => x.Amount);
+        var expectedRemaining = Math.Max(0m, remainingSupplierPayments) + Math.Max(0m, plannedOther - completedOther);
+        var funds = _lastFunds ?? FundsForOpening(snapshot.Cash);
+
+        var text = new System.Text.StringBuilder();
+        text.AppendLine($"📍 Ընթացիկ վերլուծություն — {date:dd.MM.yyyy}");
+        text.AppendLine($"Այս պահի վաճառք՝ {snapshot.Sales.SalesDisplay}");
+        text.AppendLine($"Հասանելի միջոցներ՝ {funds.Total:N0} ֏ (կանխիկ՝ {funds.Cash:N0} ֏, բանկ՝ {funds.Bank:N0} ֏)");
+        text.AppendLine();
+        text.AppendLine($"Պլանավորված ծախսեր՝ {plannedSupplierPayments + plannedOther:N0} ֏");
+        text.AppendLine($"Կատարված ծախսեր՝ {completedSupplierPayments + completedOther:N0} ֏");
+        text.AppendLine($"Մնացած սպասվող ծախսեր՝ {expectedRemaining:N0} ֏");
+        text.AppendLine($"Մնացած պլանային վճարումներից հետո մնացորդ՝ {funds.Total - expectedRemaining:N0} ֏");
+
+        if (pending.Count > 0)
+        {
+            text.AppendLine();
+            text.AppendLine("Սպասվող մատակարարներ / գործողություններ՝");
+            foreach (var row in pending)
+            {
+                var payment = row.PaymentAmount + row.OldDebtPayment;
+                text.AppendLine($"• {row.Supplier} — պատվեր {row.OrderAmount:N0} ֏, վճարում {payment:N0} ֏");
+            }
+        }
+        else text.AppendLine("✅ Մատակարարների մասով մնացած գործողություն չկա։");
+
+        if (funds.Total < expectedRemaining)
+            text.AppendLine("⚠️ Առկա միջոցներն ու այս պահի վաճառքը բավարար չեն մնացած պլանավորված ծախսերի համար։ Վճարումները վերանայեք մինչև օրվա ավարտը։");
+        else text.AppendLine("✅ Այս պահի տվյալներով մնացած պլանավորված ծախսերը կատարելի են։");
+
+        await TelegramBotClient.SendMessageAsync(settings, text.ToString());
+    }
+
+    /// <summary>
+    /// Short, point-in-time owner status.  Unlike the longer cash-flow opinion,
+    /// this message contains only the operational facts needed to decide what
+    /// still has to be done today.  A second button exposes the row-level data.
+    /// </summary>
+    private async Task SendTelegramCurrentStatusAsync(TelegramBotSettings settings, DateOnly date)
+    {
+        var snapshot = await TelegramSnapshotAsync(date);
+        var plan = PlannedSuppliersFor(date);
+        var employeeActions = _employeeSupplierActionStore.Load();
+        var ownerChanges = _supplierStatusChangeStore.Load();
+        var confirmed = plan.Where(x => IsSupplierReceiptConfirmed(x, employeeActions, ownerChanges)).ToList();
+        var supplierNames = plan.Select(x => x.Supplier).ToList();
+        var actualPayments = AllActualPayments().Where(x => x.PaidDate == date).ToList();
+        var actualSupplierPayments = actualPayments
+            .Where(x => supplierNames.Any(name => SupplierNamesMatch(name, x.Recipient))).ToList();
+
+        var plannedSupplierPayments = plan.Sum(x => x.PaymentAmount + x.OldDebtPayment);
+        var confirmedFallback = confirmed
+            .Where(row => !actualSupplierPayments.Any(payment => SupplierNamesMatch(payment.Recipient, row.Supplier)))
+            .Sum(row => row.PaymentAmount + row.OldDebtPayment);
+        var completedSupplierPayments = actualSupplierPayments.Sum(x => x.Amount) + confirmedFallback;
+
+        var plannedOther = _requiredPayments.Where(x => RequiredPaymentRules.AppliesOn(x, date)).Sum(x => x.Amount)
+            + _manualPaymentChanges.Where(x => x.PlannedDate == date).Sum(x => x.Amount)
+            + snapshot.Payments.Where(x => x.DueDate == date && !supplierNames.Any(name => SupplierNamesMatch(name, x.Supplier))).Sum(x => x.Amount)
+            + PlannedSundayPayroll(date);
+        var completedOther = actualPayments
+            .Where(x => !supplierNames.Any(name => SupplierNamesMatch(name, x.Recipient))).Sum(x => x.Amount);
+
+        BankSalesBreakdown nonCash = BankSalesBreakdown.Empty;
+        var nonCashAvailable = false;
+        if (App.Services.DataProvider is IFundsMovementProvider fundsProvider)
+        {
+            try { nonCash = await fundsProvider.GetNonCashSalesAsync(date, date); nonCashAvailable = App.Services.DataProvider is not EmptyDataProvider; }
+            catch { /* Current status remains useful even if the optional ECR breakdown is temporarily unavailable. */ }
+        }
+        var nonCashSales = nonCash.BankReport + nonCash.AmeriabankPos099 + nonCash.Idram;
+        var cashSaleRow = _cashDocuments.FirstOrDefault(x => x.Date == date && x.Type == "ecr-cash-sales");
+        var plannedTotal = plannedSupplierPayments + plannedOther;
+        var completedTotal = completedSupplierPayments + completedOther;
+        var remaining = plan.Sum(row => PaymentReconciliation.Remaining(row.PaymentAmount + row.OldDebtPayment,
+            actualSupplierPayments.Where(x => SupplierNamesMatch(x.Recipient, row.Supplier)).Sum(x => x.Amount)))
+            + PaymentReconciliation.Remaining(plannedOther, completedOther);
+        var paidSuppliers = plan.Count(row => actualSupplierPayments.Any(payment => SupplierNamesMatch(payment.Recipient, row.Supplier)) ||
+            (confirmed.Any(done => SupplierNamesMatch(done.Supplier, row.Supplier)) && row.PaymentAmount + row.OldDebtPayment > 0m));
+
+        var text = new System.Text.StringBuilder();
+        text.AppendLine($"📍 Ընթացիկ դրություն — {date:dd.MM.yyyy}");
+        text.AppendLine($"Վաճառք՝ {snapshot.Sales.SalesDisplay}");
+        text.AppendLine($"Կանխիկ վաճառք՝ {(cashSaleRow is null ? "Տվյալ չկա" : $"{cashSaleRow.Amount:N0} ֏")} · անկանխիկ՝ {(nonCashAvailable ? $"{nonCashSales:N0} ֏" : "Տվյալ չկա")}");
+        if (_cashSyncStatus?.Contains("⚠") == true) text.AppendLine(_cashSyncStatus);
+        text.AppendLine();
+        text.AppendLine($"Օրվա պատվերներ՝ {plan.Sum(x => x.OrderAmount):N0} ֏ ({plan.Count} մատակարար)");
+        text.AppendLine($"Այլ վճարումներ՝ {plannedOther:N0} ֏");
+        text.AppendLine($"Եկած/հաստատված մատակարարներ՝ {confirmed.Count}/{plan.Count}");
+        text.AppendLine($"Կատարված վճարումներ՝ {completedTotal:N0} ֏ ({paidSuppliers} մատակարար)");
+        text.AppendLine($"Մնացած վճարման՝ {remaining:N0} ֏");
+
+        if (nonCashSales > snapshot.Sales.SalesAmount)
+            text.AppendLine("ℹ️ Անկանխիկ վաճառքի տվյալը ՀԾ վճարման հաշվետվությունից է և վերանայման կարիք ունի, քանի որ այն գերազանցում է օրվա ընդհանուր վաճառքը։ ");
+        if (remaining == 0m) text.AppendLine("✅ Այս պահի պլանավորված վճարումները կատարված են։ ");
+
+        var dateCode = date.ToString("yyyy-MM-dd");
+        var buttons = new IReadOnlyList<TelegramInlineButton>[]
+        {
+            new[] { new TelegramInlineButton("🔎 Մանրամասն", $"currentdetail:{dateCode}") },
+            new[] { new TelegramInlineButton("💳 Վճարումներ", $"payments:{dateCode}"), new TelegramInlineButton("📈 Խորը վերլուծություն", $"currentanalysis:{dateCode}") }
+        };
+        await TelegramBotClient.SendMessageAsync(settings, text.ToString(), buttons);
+    }
+
+    private async Task SendTelegramCurrentStatusDetailsAsync(TelegramBotSettings settings, DateOnly date)
+    {
+        var snapshot = await TelegramSnapshotAsync(date);
+        var plan = PlannedSuppliersFor(date);
+        var employeeActions = _employeeSupplierActionStore.Load();
+        var ownerChanges = _supplierStatusChangeStore.Load();
+        var actualPayments = AllActualPayments().Where(x => x.PaidDate == date).ToList();
+        var supplierNames = plan.Select(x => x.Supplier).ToList();
+        var text = new System.Text.StringBuilder();
+        text.AppendLine($"🔎 Մանրամասն — {date:dd.MM.yyyy}");
+        text.AppendLine();
+        text.AppendLine("Մատակարարներ");
+        var rows = plan.Where(x => x.OrderAmount != 0m || x.PaymentAmount != 0m || x.OldDebtPayment != 0m ||
+                IsSupplierReceiptConfirmed(x, employeeActions, ownerChanges))
+            .OrderBy(x => x.Supplier).ToList();
+        if (rows.Count == 0) text.AppendLine("• Գործողություն ունեցող մատակարար չկա։ ");
+        foreach (var row in rows)
+        {
+            var actual = actualPayments.Where(x => SupplierNamesMatch(x.Recipient, row.Supplier)).Sum(x => x.Amount);
+            var received = IsSupplierReceiptConfirmed(row, employeeActions, ownerChanges) ? "եկել է" : "սպասվում է";
+            text.AppendLine($"• {row.Supplier} — պատվեր {row.OrderAmount:N0} ֏ | վճարում {row.PaymentAmount:N0} ֏ | հին {row.OldDebtPayment:N0} ֏ | {received}{(actual > 0m ? $" | փաստացի՝ {actual:N0} ֏" : string.Empty)}");
+        }
+
+        var other = new List<(string Category, string Name, decimal Amount, string Note)>();
+        other.AddRange(snapshot.Payments.Where(x => x.DueDate == date && !supplierNames.Any(name => SupplierNamesMatch(name, x.Supplier)))
+            .Select(x => ("Այլ", x.Supplier, x.Amount, x.Reason)));
+        other.AddRange(_requiredPayments.Where(x => RequiredPaymentRules.AppliesOn(x, date))
+            .Select(x => (x.Category, x.Name, x.Amount, x.Note)));
+        other.AddRange(_manualPaymentChanges.Where(x => x.PlannedDate == date)
+            .Select(x => ("Ձեռքով", x.Supplier, x.Amount, x.Reason)));
+        var payroll = PlannedSundayPayroll(date);
+        if (payroll > 0m) other.Add(("Աշխատավարձ", "Շաբաթվա աշխատավարձեր", payroll, ""));
+        text.AppendLine();
+        text.AppendLine("Այլ վճարումներ");
+        if (other.Count == 0) text.AppendLine("• Այլ պլանավորված վճարում չկա։ ");
+        foreach (var item in other)
+            text.AppendLine($"• {item.Category} · {item.Name} — {item.Amount:N0} ֏{(string.IsNullOrWhiteSpace(item.Note) ? string.Empty : $" ({item.Note})")}");
+
+        await TelegramBotClient.SendMessageAsync(settings, text.ToString());
+    }
+
     private async Task SendTelegramCashFlowOpinionAsync(TelegramBotSettings settings, DateOnly startDate)
     {
         var policy = _cashFlowPolicyStore.LoadOrCreate();
         var snapshot = await TelegramSnapshotAsync(startDate);
-        var funds = _lastFunds ?? FundsForOpening(snapshot.Cash);
+        var funds = await CalculateFundsAsync(startDate.AddDays(-1));
         var historicalSales = 0m;
         var hasHistory = false;
         if (App.Services.DataProvider is IBusinessSummaryProvider provider)
@@ -1045,7 +1942,7 @@ public partial class MainWindow : Window
             {
                 var history = await provider.GetBusinessSummaryAsync(startDate.AddDays(-7), startDate.AddDays(-1));
                 historicalSales = history.Sales.SalesAmount / 7m;
-                hasHistory = history.Sales.SalesAmount > 0m;
+                hasHistory = history.Sales.SalesAvailable;
             }
             catch { /* The message will explicitly say that a reliable sales forecast is unavailable. */ }
         }
@@ -1056,7 +1953,7 @@ public partial class MainWindow : Window
             + snapshot.Payments.Where(x => x.DueDate == day && x.IsMandatory).Sum(x => x.Amount)
             + PlannedSundayPayroll(day);
 
-        var actualToday = startDate == DateOnly.FromDateTime(DateTime.Today) ? snapshot.Sales.SalesAmount : (decimal?)null;
+        var actualToday = snapshot.Sales.SalesAvailable && startDate == DateOnly.FromDateTime(DateTime.Today) ? snapshot.Sales.SalesAmount : (decimal?)null;
         var analysis = CashFlowPlanner.Build(startDate, funds.Total, historicalSales, hasHistory, actualToday, policy.MinimumReserve,
             day => PlannedSuppliersFor(day), MandatoryPayments);
 
@@ -1129,7 +2026,8 @@ public partial class MainWindow : Window
     private async Task SendTelegramMorningBriefAsync(TelegramBotSettings settings, DateOnly date)
     {
         var snapshot = await TelegramSnapshotAsync(date);
-        var suppliers = PlannedSuppliersFor(date).OrderBy(x => x.Supplier).ToList();
+        var suppliers = PlannedSuppliersFor(date)
+            .Where(row => HasTelegramSupplierAction(row, date)).OrderBy(x => x.Supplier).ToList();
         var otherPayments = new List<(string Name, decimal Amount, string Note)>();
         otherPayments.AddRange(snapshot.Payments.Where(x => x.DueDate == date)
             .Select(x => (Name: x.Supplier, Amount: x.Amount, Note: x.Reason)));
@@ -1243,6 +2141,12 @@ public partial class MainWindow : Window
                 ? calculated
                 : HistoricalSuggestedOrderAmount(name, deliveryDate)
         }).ToList();
+        supplierOrderAmounts = supplierOrderAmounts
+            .Where(item => item.Amount != 0m ||
+                scheduled.Any(row => SupplierNamesMatch(row.Supplier, item.Supplier) && HasTelegramSupplierAction(row, deliveryDate)))
+            .ToList();
+        if (supplierOrderAmounts.Count == 0 && otherPayments == 0m)
+            return;
         message.AppendLine();
         message.AppendLine("```");
         message.AppendLine("Մատակարար      | Առաջարկ | Վճար.  | Հին");
@@ -1549,44 +2453,117 @@ public partial class MainWindow : Window
     private async Task LoadAsync(string page)
     {
         _currentPage = page;
+        UpdatePresentationNavigation(page);
         UpdateTopActions(page);
         try
         {
-            _snapshot ??= await App.Services.DataProvider.GetSnapshotAsync(_selectedDate);
+            if (_snapshot is null || !_snapshot.Sales.SalesAvailable)
+                _snapshot = await App.Services.DataProvider.GetSnapshotAsync(_selectedDate);
+            if (App.Services.DataProvider is ExcelDataProvider || page is "CashMovements" or "Dashboard" or "Finance")
+                await TrySyncCashDocumentsForSelectedMonthAsync();
         }
         catch (Exception exception)
         {
             // An unavailable report or missing API permission must never close the desktop app.
             // Keep the user working and make the cause visible instead.
-            App.Services.UseDataProvider(new EmptyDataProvider());
             DataSourceStatusText.Text = "Տվյալների աղբյուր՝ ՀԾ հարցման խնդիր. ցուցադրվում են միայն պահպանված փաստացի տվյալները";
-            _snapshot = await App.Services.DataProvider.GetSnapshotAsync(_selectedDate);
+            _snapshot = await new EmptyDataProvider().GetSnapshotAsync(_selectedDate);
             MessageBox.Show(
-                $"ՀԾ-ից ընտրված օրվա տվյալները չհաջողվեց բեռնել։\n\n{exception.Message}\n\nԾրագիրը բաց է մնացել փորձնական տվյալներով։ Ստուգեք ՀԾ API-ի հաշվետվությունների իրավասությունները, ապա սեղմեք «⚙ ՀԾ API» և նորից պահպանեք կարգավորումը։",
+                $"ՀԾ-ից ընտրված օրվա տվյալները չհաջողվեց բեռնել։\n\n{exception.Message}\n\nՑուցադրվում են միայն պահպանված տվյալները։ Հաջորդ թարմացման ժամանակ կապը նորից կփորձարկվի։",
                 "ՀԾ API տվյալների բեռնում", MessageBoxButton.OK, MessageBoxImage.Warning);
         }
         _snapshot = await ApplyAvailableFundsAsync(MergeImportedSuppliers(_snapshot));
         _snapshot = DecisionEngine.Evaluate(_snapshot, PlanForSelectedDate(), _requiredPayments);
         MergeApiSupplierMovements(_snapshot);
         SubtitleText.Text = $"{_snapshot.Date:dd.MM.yyyy} · Որոշումները պահանջում են ձեր հաստատումը";
+        if (!string.IsNullOrWhiteSpace(_cashSyncStatus)) DataSourceStatusText.Text = _cashSyncStatus;
         PageHost.Content = page switch
         {
-            "Finance" => Views.Finance(_snapshot),
-            "Suppliers" => Views.Suppliers(PlanForSelectedDate(), _snapshot.Suppliers, _partnerDebts, _employeeSupplierActionStore.Load(), _supplierStatusChangeStore.Load(), SaveSupplierWeekRow, ShowSupplierEmployeeStatus, EditSupplierStatus),
+            "Finance" => Views.Finance(_snapshot, await BuildWeeklyFinancialPlanAsync(_selectedDate), _cashFlowPolicyStore.LoadOrCreate(), ConfigureCashFlowPolicy),
+            "Suppliers" => await SupplierEditorViewAsync(_selectedDate),
             "PurchasePlan" => await PurchasePlanViewAsync(),
             "SupplierSales" => await SupplierSalesViewAsync(),
-            "Salaries" => Views.Salaries(_selectedDate, _salaryAccruals, _salaryPayments, _pendingSalaryEmployees, AddSalaryAccrual, AddSalaryPayment, OpenSalaryEmployee, ApprovePendingSalaryEmployee, RejectPendingSalaryEmployee),
-            "Payments" => Views.Payments(_snapshot, _completedPayments, _requiredPayments, PlanForSelectedDate(), _employeeSupplierActionStore.Load(), _salaryPayments, PlannedSundayPayroll(_selectedDate), EditRequiredPayment, DeleteRequiredPayment),
-            "Approvals" => Views.Approvals(_pendingEmployeeOrderChangeStore.Load(), ApprovePendingChangeFromDesktopAsync, RejectPendingChangeFromDesktopAsync, ApproveAllPendingChangesFromDesktopAsync),
+            "CashMovements" => Views.CashMovements(_selectedDate, CashLedgerForSelectedMonth(FundsForOpening(_snapshot.Cash)), CashMovementsForSelectedDate(), _cashSyncStatus, EditCashDay),
+            "Salaries" => Views.Salaries(_selectedDate, _salaryAccruals, _salaryPayments, _pendingSalaryEmployees, AddSalaryAccrual, AddSalaryPayment, OpenSalaryEmployee, ApprovePendingSalaryEmployee, RejectPendingSalaryEmployee, RemoveSalaryEmployee),
+            "Payments" => Views.Payments(_snapshot, AllActualPayments(), _requiredPayments, PlanForSelectedDate(), _employeeSupplierActionStore.Load(), _salaryPayments, PlannedSundayPayroll(_selectedDate), EditRequiredPayment, DeleteRequiredPayment),
+            "Approvals" => Views.Approvals(_pendingEmployeeOrderChangeStore.Load(), ApprovePendingChangeFromDesktopAsync, RejectPendingChangeFromDesktopAsync, ApproveAllPendingChangesFromDesktopAsync, ResolveSupplierFromDesktop, KnownSupplierNames()),
             "DeliverySchedule" => Views.DeliverySchedule(_deliveryPatterns, UpdateSuggestedOrderAmount),
             "Recommendations" => Views.Recommendations(_snapshot, _employeeSupplierActionStore.Load(), _employeeTaskStore.Load(), _employeeTaskActionStore.Load(), _employeeIssueStore.Load()),
             "Summary" => await SummaryViewAsync(),
-            _ => Views.Dashboard(_snapshot, _completedPayments, _requiredPayments, PlanForSelectedDate(), _employeeSupplierActionStore.Load(), CashSummaryForSelectedDate(), _lastFunds ?? FundsForOpening(_snapshot.Cash), _pendingEmployeeOrderChangeStore.Load().Count, OpenAvailableFunds, () => _ = LoadAsync("Payments"), () => _ = LoadAsync("Recommendations"), () => _ = LoadAsync("Approvals"))
+            _ => Views.Dashboard(_snapshot, AllActualPayments(), _requiredPayments, PlanForSelectedDate(), _employeeSupplierActionStore.Load(), CashSummaryForSelectedDate(), _lastFunds ?? FundsForOpening(_snapshot.Cash), _pendingEmployeeOrderChangeStore.Load().Count, OpenAvailableFunds, () => _ = LoadAsync("Payments"), () => _ = LoadAsync("Recommendations"), () => _ = LoadAsync("Approvals"), DashboardTrend())
         };
+        if (PageHost.Content is DependencyObject presentation) PresentationTheme.Apply(presentation);
+    }
+
+    // Cash movements are operational records.  They are refreshed from HTS
+    // separately from the dashboard reports so a missing cash-report right
+    // never makes the whole desktop application fall back to demo data.
+    private Task TrySyncCashDocumentsForSelectedMonthAsync() => SyncCashDocumentsAsync(_selectedDate);
+
+    private async Task SyncCashDocumentsAsync(DateOnly date)
+    {
+        if (App.Services.DataProvider is not ICashDocumentProvider provider) return;
+        if (provider is ExcelDataProvider)
+        {
+            var state = _excelImportStore.Load();
+            var allDates = state.Batches.SelectMany(x => x.Dates).ToList();
+            var start = allDates.Count == 0 ? date : allDates.Min();
+            var end = allDates.Count == 0 ? date : allDates.Max();
+            var records = await provider.GetCashDocumentsAsync(start,end);
+            _cashDocuments.Clear(); _cashDocuments.AddRange(records);
+            var manualNonCashDays=_cashDayOverrideStore.Load().Days.Where(x=>x.NonCash.HasValue).Select(x=>x.Date).ToHashSet();
+            var missing = state.Batches.Where(x => x.Kind is "cash" or "sales").SelectMany(x => x.Dates)
+                .Where(d => d >= start && d <= date && !state.NonCash.Any(n => n.Date == d) && !manualNonCashDays.Contains(d)).Distinct().Order().ToList();
+            _cashSyncStatus = "Excel ռեժիմ․ վերջին ներմուծված տվյալներ։" + (missing.Count == 0 ? "" :
+                "\n⚠ Մուտքը վերցված է ամբողջ վաճառքով։ Անկանխիկը դեռ նշված չէ (ժամանակավորապես 0)․ " + string.Join(", ",missing.Select(d => d.ToString("dd.MM"))));
+            if (_fundsTransactions.Any(t => TryGetSupplierPayment(t,out var supplier,out _) &&
+                CashDocumentImportService.SupplierPaymentRows(records).Any(p=>p.Date==t.Date && p.Amount==t.Amount && SupplierNamesMatch(p.Recipient,supplier))))
+                _cashSyncStatus += "\n⚠ Կա նույն մատակարարի նույն գումարով ձեռքով վճարում և ներմուծված փաստաթուղթ․ հնարավոր կրկնումը ճշտեք։ Դրանք ինքնաբերաբար չեն միացվել։";
+            return;
+        }
+
+        var firstDay = _availableFunds.OpeningMonth is { } openingDate && openingDate <= date
+            ? new DateOnly(openingDate.Year, openingDate.Month, 1) : new DateOnly(date.Year, date.Month, 1);
+        try
+        {
+            var documents = (await provider.GetCashDocumentsAsync(firstDay, date)).ToList();
+            if (documents.Count == 0)
+            {
+                _cashSyncStatus = "⚠ ՀԾ-ից տվյալ ժամանակահատվածի դրամարկղային օրդեր չվերադարձավ։ Պահպանված կամ ձեռքով ներմուծված տվյալներն են ցուցադրվում։";
+                return;
+            }
+
+            // Upsert preserves Excel/XML imports when HTS returns only a
+            // partial document set, while still adding every live document.
+            _cashDocumentStore.Upsert(documents, _cashDocuments);
+            _cashSyncStatus = $"✓ ՀԾ-ից թարմացվել է {documents.Count:N0} դրամարկղային գրանցում ({firstDay:dd.MM}–{date:dd.MM.yyyy})։";
+            if (provider is HtsApiDataProvider hts && hts.LastCashWarning is { } warning)
+                _cashSyncStatus += "\n⚠ Տվյալները մասնակի են․ " + warning;
+            var incomeOrders = _cashDocuments.Where(x => x.Date >= firstDay && x.Date <= date &&
+                (x.Type.Contains("cashinput", StringComparison.OrdinalIgnoreCase) || x.Type.Contains("Մուտքի", StringComparison.OrdinalIgnoreCase)) &&
+                x.Information.Contains("հասույթ", StringComparison.OrdinalIgnoreCase) &&
+                _cashDocuments.Any(s => s.Date == x.Date && s.Type == "ecr-cash-sales" && s.Amount != 0m)).ToList();
+            if (incomeOrders.Count > 0)
+                _cashSyncStatus += "\n⚠ ՀԴՄ կանխիկի հետ կա նաև հասույթի մուտքի օրդեր․ համադրեք փաստաթղթերը, հնարավոր է նույն գումարի կրկնակի մուտք։";
+            if (_fundsTransactions.Any(t => t.Date >= firstDay && t.Date <= date && TryGetSupplierPayment(t, out var name, out _) &&
+                CashDocumentImportService.SupplierPaymentRows(_cashDocuments).Any(p => p.Date == t.Date && p.Amount == t.Amount && SupplierNamesMatch(p.Recipient, name))))
+                _cashSyncStatus += "\n⚠ Նույն մատակարարի համար կա հավասար ձեռքով վճարում և ՀԾ փաստաթուղթ․ ստուգեք՝ նույն վճարո՞ւմն է, թե երկու առանձին վճարում։";
+        }
+        catch (Exception exception)
+        {
+            // Keep the last successfully imported cash ledger available.
+            // The user can still work even if this optional HTS report is
+            // temporarily unavailable or needs a separate permission.
+            _cashSyncStatus = $"⚠ ՀԾ դրամարկղային ներմուծումը չստացվեց․ {exception.Message}";
+        }
     }
 
     private async void ApprovePendingChangeFromDesktopAsync(Guid id)
     {
+        var all = _pendingEmployeeOrderChangeStore.Load();
+        var target = all.FirstOrDefault(x => x.Id == id);
+        if (target is not null && ApprovalWarnings.Duplicate(target,all) &&
+            MessageBox.Show("Այս գրանցումն ունի հավանական կրկնում։ Ստուգե՞լ եք և ցանկանում եք հաստատել հենց այս տողը։","Հավանական կրկնում",MessageBoxButton.YesNo) != MessageBoxResult.Yes) return;
         var settings = _telegramBotSettingsStore.Load();
         await ApproveEmployeeOrderChangeAsync(settings, id, announceToOwner: false);
         await LoadAsync("Approvals");
@@ -1601,7 +2578,8 @@ public partial class MainWindow : Window
 
     private async void ApproveAllPendingChangesFromDesktopAsync()
     {
-        var changes = _pendingEmployeeOrderChangeStore.Load();
+        var all = _pendingEmployeeOrderChangeStore.Load();
+        var changes = all.Where(x => !ApprovalWarnings.Unknown(x,KnownSupplierNames()) && !ApprovalWarnings.Duplicate(x,all)).ToList();
         if (changes.Count == 0) return;
         if (MessageBox.Show($"Հաստատե՞լ բոլոր {changes.Count} փոփոխությունները։", "Հաստատումներ", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
         var settings = _telegramBotSettingsStore.Load();
@@ -1611,7 +2589,7 @@ public partial class MainWindow : Window
 
     private void UpdateTopActions(string page)
     {
-        var dateVisible = page is "Dashboard" or "Finance" or "Suppliers" or "PurchasePlan" or "SupplierSales" or "Salaries" or "Payments" or "Recommendations" or "Summary";
+        var dateVisible = page is "Dashboard" or "Finance" or "Suppliers" or "PurchasePlan" or "SupplierSales" or "CashMovements" or "Salaries" or "Payments" or "Recommendations" or "Summary";
         DateLabel.Visibility = dateVisible ? Visibility.Visible : Visibility.Collapsed;
         ViewDatePicker.Visibility = dateVisible ? Visibility.Visible : Visibility.Collapsed;
         ShowDateButton.Visibility = dateVisible ? Visibility.Visible : Visibility.Collapsed;
@@ -1620,14 +2598,90 @@ public partial class MainWindow : Window
         TelegramButton.Visibility = page == "Dashboard" ? Visibility.Visible : Visibility.Collapsed;
         EmployeeTelegramButton.Visibility = page == "Dashboard" ? Visibility.Visible : Visibility.Collapsed;
         CompletedPaymentButton.Visibility = page is "Dashboard" or "Payments" ? Visibility.Visible : Visibility.Collapsed;
+        FundsTransactionButton.Visibility = page is "Dashboard" or "Finance" or "Payments" or "CashMovements" ? Visibility.Visible : Visibility.Collapsed;
+        CashFlowPolicyButton.Visibility = page == "Finance" ? Visibility.Visible : Visibility.Collapsed;
         RequiredPaymentButton.Visibility = page == "Payments" ? Visibility.Visible : Visibility.Collapsed;
         SupplierDayButton.Visibility = page == "Suppliers" ? Visibility.Visible : Visibility.Collapsed;
         SupplierMembershipButton.Visibility = page == "Suppliers" ? Visibility.Visible : Visibility.Collapsed;
         PaymentChangeButton.Visibility = page == "Payments" ? Visibility.Visible : Visibility.Collapsed;
         RefreshButton.Visibility = Visibility.Visible;
         CashImportButton.Visibility = Visibility.Collapsed;
-        CashAdjustmentButton.Visibility = page is "Dashboard" or "Finance" ? Visibility.Visible : Visibility.Collapsed;
+        CashAdjustmentButton.Visibility = page is "Dashboard" or "Finance" or "CashMovements" ? Visibility.Visible : Visibility.Collapsed;
     }
+
+    private async Task<WeeklyFinancialPlan> BuildWeeklyFinancialPlanAsync(DateOnly startDate)
+    {
+        var policy = _cashFlowPolicyStore.LoadOrCreate();
+        var snapshot = _snapshot ?? await App.Services.DataProvider.GetSnapshotAsync(startDate);
+        var historicalDailySales = 0m;
+        var hasSalesHistory = false;
+        if (App.Services.DataProvider is IBusinessSummaryProvider provider)
+        {
+            try
+            {
+                var history = await provider.GetBusinessSummaryAsync(startDate.AddDays(-7), startDate.AddDays(-1));
+                historicalDailySales = history.Sales.SalesAmount / 7m;
+                hasSalesHistory = history.Sales.SalesAvailable;
+            }
+            catch { /* An unavailable optional report must not block the planning page. */ }
+        }
+
+        var baselineWeekSales = policy.WeeklySalesBaselineOverride ?? (hasSalesHistory ? historicalDailySales * 7m : 0m);
+        if(policy.WeeklySalesBaselineOverride is null)
+        {
+            var automatic=AutomaticCashDays(RawCashDeskMovements());
+            foreach(var edit in _cashDayOverrideStore.Load().Days.Where(x=>x.Date>=startDate.AddDays(-7) && x.Date<startDate && x.Sales.HasValue))
+            {
+                decimal original=automatic.GetValueOrDefault(edit.Date)?.Sales??0m;
+                if(App.Services.DataProvider is not ExcelDataProvider && App.Services.DataProvider is IBusinessSummaryProvider dailyProvider)
+                {
+                    try { var report=await dailyProvider.GetBusinessSummaryAsync(edit.Date,edit.Date); if(!report.Sales.SalesAvailable) continue; original=report.Sales.SalesAmount; }
+                    catch { continue; }
+                }
+                baselineWeekSales+=edit.Sales!.Value-original;
+            }
+        }
+        var baselineDailySales = baselineWeekSales / 7m;
+        decimal FixedDue(DateOnly date) =>
+            _requiredPayments.Where(x => RequiredPaymentRules.AppliesOn(x, date)).Sum(x => x.Amount)
+            + _manualPaymentChanges.Where(x => x.PlannedDate == date).Sum(x => x.Amount)
+            + snapshot.Payments.Where(x => x.DueDate == date && x.IsMandatory).Sum(x => x.Amount);
+        decimal SalaryDue(DateOnly date) => PlannedSundayPayroll(date);
+        decimal Mandatory(DateOnly date) => FixedDue(date) + SalaryDue(date);
+
+        // For today, actual sales replace the baseline; the other days keep
+        // the previous-week sales baseline until their actual figures arrive.
+        var actualToday = snapshot.Sales.SalesAvailable && startDate == DateOnly.FromDateTime(DateTime.Today) ? snapshot.Sales.SalesAmount : (decimal?)null;
+        if(startDate==DateOnly.FromDateTime(DateTime.Today)) actualToday=_cashDayOverrideStore.Load().Days.LastOrDefault(x=>x.Date==startDate)?.Sales??actualToday;
+        var openingFunds = await CalculateFundsAsync(startDate.AddDays(-1));
+        var cashFlow = CashFlowPlanner.Build(startDate, openingFunds.Total,
+            baselineDailySales, baselineWeekSales > 0m, actualToday, policy.MinimumReserve,
+            day => PlannedSuppliersFor(day), Mandatory);
+
+        var daysInMonth = DateTime.DaysInMonth(startDate.Year, startDate.Month);
+        decimal FixedReserve(DateOnly day)
+        {
+            var currentMonth = _requiredPayments.Where(x => RequiredPaymentRules.AppliesInMonth(x, day)).ToList();
+            if (policy.FixedCostAllocation == FixedCostAllocationMode.EvenlyAcrossMonth)
+                return currentMonth.Sum(x => x.Amount) / daysInMonth;
+            return currentMonth.Where(x => x.PaymentDay >= day.Day).Sum(x => x.Amount / Math.Max(1, x.PaymentDay - day.Day + 1));
+        }
+        decimal SalaryAccrual(DateOnly day) => _salaryAccruals.Where(x => x.Date == day).Sum(x => x.Amount);
+
+        return WeeklyFinancialPlanBuilder.Build(cashFlow, baselineWeekSales,
+            cashFlow.Days.Sum(x => FixedDue(x.Date)), cashFlow.Days.Sum(x => SalaryDue(x.Date)),
+            cashFlow.WeekSupplierPayments, FixedReserve, SalaryAccrual);
+    }
+
+    private void ConfigureCashFlowPolicy()
+    {
+        var window = new CashFlowPolicyWindow(_cashFlowPolicyStore.LoadOrCreate()) { Owner = this };
+        if (window.ShowDialog() != true || window.Result is null) return;
+        _cashFlowPolicyStore.Save(window.Result);
+        _ = LoadAsync("Finance");
+    }
+
+    private void ConfigureCashFlowPolicy_Click(object sender, RoutedEventArgs e) => ConfigureCashFlowPolicy();
 
     private enum SummaryPeriod { Month, Week, Day }
 
@@ -1638,32 +2692,53 @@ public partial class MainWindow : Window
         AmeriabankPos099: _availableFunds.AmeriabankPos099 ?? 0m,
         Idram: _availableFunds.Idram ?? 0m);
 
-    private async Task<DashboardSnapshot> ApplyAvailableFundsAsync(DashboardSnapshot source)
+    private async Task<AvailableFundsBreakdown> CalculateFundsAsync(DateOnly asOfDate)
     {
-        var funds = FundsForOpening(source.Cash);
-        var start = new DateOnly(source.Date.Year, source.Date.Month, 1);
-        var isConfiguredForMonth = _availableFunds.OpeningMonth is { } opening &&
-            opening.Year == source.Date.Year && opening.Month == source.Date.Month;
+        var funds = FundsForOpening(new CashPosition(0m, 0m));
+        var start = CashOpeningStart(asOfDate);
+        await RefreshAutomaticNonCashAsync(start,asOfDate);
+        var isConfiguredForMonth = start <= asOfDate;
         if (isConfiguredForMonth)
         {
-            var cashDeskBalance = CashDeskBalance("0001", funds.CashDesk, start, source.Date);
-            var vaultBalance = CashDeskBalance("0002", funds.CashVault, start, source.Date);
+            var cashDeskBalance = CashDeskBalance("0001", funds.CashDesk, start, asOfDate);
+            var vaultBalance = CashDeskBalance("0002", funds.CashVault, start, asOfDate);
+            var bankCorrection = _cashDeskAdjustments.AsEnumerable().Reverse()
+                .Where(x => x.CashDesk == "bank" && x.Date >= start && x.Date <= asOfDate)
+                .OrderByDescending(x => x.Date).FirstOrDefault();
+            var bankStart = bankCorrection?.Date.AddDays(1) ?? start;
             BankSalesBreakdown bankMovement = BankSalesBreakdown.Empty;
-            if (App.Services.DataProvider is IFundsMovementProvider provider)
+            if (bankStart <= asOfDate && App.Services.DataProvider is IFundsMovementProvider provider)
             {
-                try { bankMovement = await provider.GetNonCashSalesAsync(start, source.Date); }
-                catch { /* The dashboard stays usable if the optional ECR report is not enabled. */ }
+                try { bankMovement = await provider.GetNonCashSalesAsync(bankStart, asOfDate); }
+                catch (Exception ex) { _cashSyncStatus = "⚠ Անկանխիկ մուտքերը չեն թարմացվել․ " + ex.Message; }
             }
+            var cashAuto=AutomaticCashDays(RawCashDeskMovements());
+            var nonCashDelta=_cashDayOverrideStore.Load().Days.Where(x=>x.Date>=bankStart && x.Date<=asOfDate && x.NonCash.HasValue)
+                .Sum(x=>x.NonCash!.Value-(cashAuto.GetValueOrDefault(x.Date)?.NonCash??0));
             funds = funds with
             {
                 CashDesk = cashDeskBalance,
                 CashVault = vaultBalance,
-                BankReport = funds.BankReport + bankMovement.BankReport,
-                AmeriabankPos099 = funds.AmeriabankPos099 + bankMovement.AmeriabankPos099,
-                Idram = funds.Idram + bankMovement.Idram
+                // Owner-entered bank payments and cash withdrawals reduce the
+                // non-cash balance immediately.  A withdrawal is added to the
+                // target cash desk by AllCashDeskMovements(), so it is not lost.
+                BankReport = (bankCorrection?.ClosingBalance ?? funds.BankReport) + bankMovement.BankReport + nonCashDelta - ManualBankOutflows(bankStart, asOfDate) + ManualBankInflows(bankStart, asOfDate),
+                AmeriabankPos099 = (bankCorrection is null ? funds.AmeriabankPos099 : 0m) + bankMovement.AmeriabankPos099,
+                Idram = (bankCorrection is null ? funds.Idram : 0m) + bankMovement.Idram
             };
         }
+        return funds;
+    }
+
+    private async Task<DashboardSnapshot> ApplyAvailableFundsAsync(DashboardSnapshot source)
+    {
+        var funds = await CalculateFundsAsync(source.Date);
         _lastFunds = funds;
+        var warnings = new List<string>();
+        if (!string.IsNullOrWhiteSpace(source.Sales.DataWarning)) warnings.AddRange(source.Sales.DataWarning.Split('\n'));
+        if (_cashSyncStatus?.Contains("⚠") == true) warnings.AddRange(_cashSyncStatus.Split('\n'));
+        if (_availableFunds.OpeningMonth is null) warnings.Add("⚠ Մեկնարկային մնացորդների ամսաթիվը հաստատված չէ․ կարգավորեք հասանելի միջոցները։");
+        if(_salaryPayments.Any(x=>x.PaidDate<=source.Date && x.CashSource is null)) warnings.Add("⚠ Կան աշխատավարձի հին վճարումներ՝ առանց դրամական աղբյուրի։ Աշխատողներ → Խմբագրել․ ընտրեք աղբյուրը միայն եթե ելքն արդեն ներմուծված չէ։");
         return new DashboardSnapshot
         {
             Date = source.Date,
@@ -1672,27 +2747,161 @@ public partial class MainWindow : Window
             SupplierMovements = source.SupplierMovements,
             Payments = source.Payments,
             Forecast = source.Forecast,
-            Sales = source.Sales,
+            Sales = source.Sales with { DataWarning = warnings.Count == 0 ? null : string.Join("\n", warnings.Distinct()) },
             Recommendations = source.Recommendations,
             Tasks = source.Tasks
         };
     }
 
     private decimal CashDeskBalance(string cashDesk, decimal openingBalance, DateOnly start, DateOnly end)
+        => CashBalanceCalculator.Balance(cashDesk, openingBalance, start, end, EffectiveCashAdjustments(), AllCashDeskMovements());
+
+    /// <summary>
+    /// The cash ledger has three sources: imported HTS cash documents,
+    /// confirmed supplier receipts (always paid from 0001 by the agreed
+    /// business rule), and owner-entered cash/bank transactions.
+    /// </summary>
+    private IReadOnlyList<CashLedgerMovement> AllCashDeskMovements()
     {
-        var correction = _cashDeskAdjustments
-            .Where(x => x.CashDesk == cashDesk && x.Date >= start && x.Date <= end)
-            .OrderByDescending(x => x.Date)
-            .FirstOrDefault();
-        var balance = correction?.ClosingBalance ?? openingBalance;
-        var movementStart = correction is null ? start : correction.Date.AddDays(1);
-        foreach (var movement in CashDocumentImportService.CashDeskMovements(_cashDocuments)
-                     .Where(x => x.Date >= movementStart && x.Date <= end))
+        var raw=RawCashDeskMovements();
+        return CashDayOverrideRules.Apply(raw,AutomaticCashDays(raw),_cashDayOverrideStore.Load().Days);
+    }
+
+    private IReadOnlyList<CashLedgerMovement> RawCashDeskMovements()
+    {
+        var imported = CashDocumentImportService.CashDeskMovements(_cashDocuments);
+        var supplierPayments = ConfirmedSupplierCashMovements();
+        var manual = _fundsTransactions
+            .Where(x => x.Source is "0001" or "0002" || !string.IsNullOrWhiteSpace(x.TargetCashDesk))
+            .Select(x => new CashLedgerMovement(
+                x.Date,
+                x.Source is "0001" or "0002" ? x.Source : string.Empty,
+                x.TargetCashDesk,
+                x.Amount,
+                $"OWNER-{x.Id:N}",
+                x.Purpose,
+                x.Category,
+                !string.IsNullOrWhiteSpace(x.TargetCashDesk)));
+
+        var local=LocalPaymentMovements();
+        return imported.Concat(supplierPayments).Concat(manual).Concat(local.Where(x=>x.SourceCashDesk is "0001" or "0002"))
+            .OrderBy(x => x.Date).ThenBy(x => x.DocumentNumber).ToList();
+    }
+
+    private IReadOnlyList<CashLedgerMovement> ConfirmedSupplierCashMovements()
+    {
+        var employeeActions = _employeeSupplierActionStore.Load();
+        var ownerChanges = _supplierStatusChangeStore.Load();
+        var importedCashPayments = CashDocumentImportService.SupplierPaymentRows(_cashDocuments).ToList();
+
+        return _supplierWeekRows
+            .Where(row => row.PaymentAmount + row.OldDebtPayment > 0m)
+            .Where(row => IsSupplierReceiptConfirmed(row, employeeActions, ownerChanges))
+            .Select(row =>
+            {
+                var expected = row.PaymentAmount + row.OldDebtPayment;
+                var imported = importedCashPayments
+                    .Where(x => x.Date == row.Date && SupplierNamesMatch(x.Recipient, row.Supplier))
+                    .Sum(x => x.Amount);
+                var manual = _fundsTransactions.Where(x => x.Date == row.Date &&
+                    TryGetSupplierPayment(x, out var supplier, out _) && SupplierNamesMatch(supplier, row.Supplier)).Sum(x => x.Amount);
+                manual+=_completedPayments.Where(x=>x.CashSource is not null && x.PaidDate==row.Date && SupplierNamesMatch(x.Recipient,row.Supplier)).Sum(x=>x.Amount);
+                return new { Row = row, Remaining = PaymentReconciliation.Unrecorded(expected, imported, manual) };
+            })
+            .Where(x => x.Remaining > 0m)
+            .Select(x => new CashLedgerMovement(
+                x.Row.Date, "0001", null, x.Remaining,
+                $"SUPPLIER-CONFIRMED-{x.Row.Date:yyyyMMdd}-{NormalizeSupplierName(x.Row.Supplier)}",
+                x.Row.Supplier, "Հաստատված վճարման՝ այլ աղբյուրով չհաշվառված մասը", false))
+            .ToList();
+    }
+
+    private static bool IsSupplierReceiptConfirmed(
+        SupplierWeekPlanRow row,
+        IReadOnlyList<EmployeeSupplierAction> employeeActions,
+        IReadOnlyList<SupplierStatusChange> ownerChanges)
+    {
+        var employee = employeeActions
+            .Where(x => x.Date == row.Date && SupplierNamesMatch(x.Supplier, row.Supplier))
+            .OrderByDescending(x => x.ReportedAt).FirstOrDefault();
+        var owner = ownerChanges
+            .Where(x => x.Date == row.Date && SupplierNamesMatch(x.Supplier, row.Supplier))
+            .OrderByDescending(x => x.ChangedAt).FirstOrDefault();
+        var status = owner is not null && (employee is null || owner.ChangedAt >= employee.ReportedAt)
+            ? owner.NewStatus : employee?.Status;
+        return status is "Կատարված է" or "Հաստատված" or "Հաստատված է";
+    }
+
+    private decimal ManualBankOutflows(DateOnly start, DateOnly end) =>
+        _fundsTransactions.Where(x => x.Source == "bank" && x.Date >= start && x.Date <= end).Sum(x => x.Amount)
+        + LocalPaymentMovements().Where(x=>x.SourceCashDesk=="bank" && x.Date>=start && x.Date<=end).Sum(x=>x.Amount);
+
+    private decimal ManualBankInflows(DateOnly start, DateOnly end) =>
+        _fundsTransactions.Where(x => x.TargetCashDesk == "bank" && x.Date >= start && x.Date <= end).Sum(x => x.Amount);
+
+    private IReadOnlyList<CompletedPayment> AllActualPayments()
+    {
+        // A bank-to-cash transfer is not an expense and must not appear as a
+        // completed payment. Every other manually entered transaction is an
+        // actual payment and therefore appears in the Payments page.
+        var ownerPayments = _fundsTransactions
+            .Where(x => string.IsNullOrWhiteSpace(x.TargetCashDesk))
+            .Select(x =>
+            {
+                var recipient = TryGetSupplierPayment(x, out var supplier, out _) ? supplier : x.Purpose;
+                return new CompletedPayment(recipient, x.Amount, x.Date,
+                    $"{FundsSourceLabel(x.Source)} · {x.Category}", $"OWNER-{x.Id:N}");
+            });
+        var cashPayments = AllCashDeskMovements()
+            .Where(x => !x.IsInternalTransfer && !string.IsNullOrWhiteSpace(x.SourceCashDesk) &&
+                !x.DocumentNumber.StartsWith("LOCAL-PAY-",StringComparison.Ordinal) && !x.DocumentNumber.StartsWith("SALARY-PAY-",StringComparison.Ordinal) &&
+                !x.DocumentNumber.StartsWith("DAY-ADJUST-", StringComparison.Ordinal) && !x.DocumentNumber.StartsWith("OWNER-", StringComparison.Ordinal) && !x.DocumentNumber.StartsWith("HTS-CASH-SALES-", StringComparison.Ordinal))
+            .Select(x => new CompletedPayment(string.IsNullOrWhiteSpace(x.Partner) ? x.ContractOrReason : x.Partner,
+                x.Amount, x.Date, x.ContractOrReason, x.DocumentNumber));
+        // Prefer current source documents over older imported snapshots of the same payment.
+        var covered = App.Services.DataProvider is ExcelDataProvider
+            ? _excelImportStore.Load().Batches.Where(x => x.Kind == "cash").SelectMany(x => x.Dates).ToHashSet() : [];
+        var prior = _completedPayments.Where(x => !(covered.Contains(x.PaidDate) && x.Note.StartsWith("ՀԾ դրամարկղային փաստաթուղթ")));
+        return cashPayments.Concat(prior).Concat(ownerPayments)
+            .GroupBy(x => (x.PaidDate, Reference: x.SourceDocument ?? Guid.NewGuid().ToString(), Recipient: NormalizeSupplierName(x.Recipient)))
+            .Select(x => x.First()).ToList();
+    }
+
+    private IReadOnlyList<CashLedgerMovement> CashMovementsForSelectedDate() =>
+        AllCashDeskMovements()
+            .Where(x => x.Date == _selectedDate)
+            .OrderBy(x => x.DocumentNumber)
+            .ToList();
+
+    private IReadOnlyList<CashDayLedger> CashLedgerForSelectedMonth(AvailableFundsBreakdown openingFunds)
+    {
+        var start = new DateOnly(_selectedDate.Year, _selectedDate.Month, 1);
+        var movements = AllCashDeskMovements()
+            .Where(x => x.Date >= start && x.Date <= _selectedDate).ToList();
+        var openingStart = CashOpeningStart(_selectedDate);
+        var effectiveAdjustments=EffectiveCashAdjustments();
+        var automatic=AutomaticCashDays(RawCashDeskMovements()); var overrides=_cashDayOverrideStore.Load().Days;
+        var cashDesk = CashDeskBalance("0001", openingFunds.CashDesk, openingStart, start.AddDays(-1));
+        var vault = CashDeskBalance("0002", openingFunds.CashVault, openingStart, start.AddDays(-1));
+        var rows = new List<CashDayLedger>();
+        for (var date = start; date <= _selectedDate; date = date.AddDays(1))
         {
-            if (movement.SourceCashDesk == cashDesk) balance -= movement.Amount;
-            if (movement.TargetCashDesk == cashDesk) balance += movement.Amount;
+            var correction0001 = effectiveAdjustments.LastOrDefault(x => x.Date == date && x.CashDesk == "0001");
+            var correction0002 = effectiveAdjustments.LastOrDefault(x => x.Date == date && x.CashDesk == "0002");
+            var day = movements.Where(x => x.Date == date).ToList();
+            var in0001 = day.Where(x => x.TargetCashDesk == "0001").Sum(x => x.Amount);
+            var out0001 = day.Where(x => x.SourceCashDesk == "0001").Sum(x => x.Amount);
+            var in0002 = day.Where(x => x.TargetCashDesk == "0002").Sum(x => x.Amount);
+            var out0002 = day.Where(x => x.SourceCashDesk == "0002").Sum(x => x.Amount);
+            if (correction0001 is not null) { cashDesk = correction0001.ClosingBalance; }
+            else cashDesk += in0001 - out0001;
+            if (correction0002 is not null) { vault = correction0002.ClosingBalance; }
+            else vault += in0002 - out0002;
+            var edit=overrides.LastOrDefault(x=>x.Date==date);
+            var values=CashDayOverrideRules.Effective(automatic.GetValueOrDefault(date)??new(0,0,0,0,0,0),edit);
+            rows.Add(new CashDayLedger(date, in0001, out0001, cashDesk, in0002, out0002, vault) { GrossSales=values.Sales,NonCash=values.NonCash,OtherCashIn=values.OtherIn,IsManual=edit is not null && new[]{edit.Sales,edit.NonCash,edit.OtherIn,edit.Out,edit.VaultIn,edit.VaultOut,edit.Closing,edit.VaultClosing}.Any(x=>x.HasValue) });
         }
-        return balance;
+        return rows;
     }
 
     private async void OpenAvailableFunds()
@@ -1710,11 +2919,11 @@ public partial class MainWindow : Window
 
     private async void AddCashDeskAdjustment_Click(object sender, RoutedEventArgs e)
     {
-        var window = new CashDeskAdjustmentWindow(_selectedDate) { Owner = this };
+        var window = new CashDeskAdjustmentWindow(_selectedDate, _cashDeskAdjustments) { Owner = this };
         if (window.ShowDialog() != true || window.Result is null) return;
-        _cashDeskAdjustments.RemoveAll(x => x.Date == window.Result.Date && x.CashDesk == window.Result.CashDesk);
+        try { _cashDeskAdjustmentStore.Save(_cashDeskAdjustments.Append(window.Result).ToList()); }
+        catch (Exception ex) { MessageBox.Show(ex.Message, "Մնացորդը չի պահպանվել"); return; }
         _cashDeskAdjustments.Add(window.Result);
-        _cashDeskAdjustmentStore.Save(_cashDeskAdjustments);
         _snapshot = null;
         await LoadAsync("Dashboard");
     }
@@ -1733,7 +2942,7 @@ public partial class MainWindow : Window
             summary = new BusinessSummary(start, end, snapshot.Sales, [], [], 0m, 0m);
         }
 
-        var paid = _completedPayments.Where(x => x.PaidDate >= start && x.PaidDate <= end).Sum(x => x.Amount);
+        var paid = AllActualPayments().Where(x => x.PaidDate >= start && x.PaidDate <= end).Sum(x => x.Amount);
         var supplied = summary.SuppliedAmount;
         summary = summary with { SupplierPayments = paid, DebtChange = supplied - paid };
         return Views.Summary(summary, label,
@@ -1744,29 +2953,15 @@ public partial class MainWindow : Window
 
     private async Task<UIElement> PurchasePlanViewAsync()
     {
-        var deliveryDate = _selectedDate.AddDays(1);
-        var scheduled = PlannedSuppliersFor(deliveryDate);
-        var savedOrFreshProposals = await GetOrBuildPurchaseProposalsAsync(_selectedDate, deliveryDate, scheduled, showErrors: true);
-        return Views.PurchasePlan(_selectedDate, deliveryDate, scheduled, savedOrFreshProposals);
-
-#pragma warning disable CS0162 // Kept below temporarily as a reference for the previous API-only flow.
-        var coverageDays = scheduled.Select(x => x.Supplier).Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(x => x, x => DaysUntilNextDelivery(x, deliveryDate), StringComparer.OrdinalIgnoreCase);
-        IReadOnlyList<PurchaseProposal> proposals = [];
-        if (App.Services.DataProvider is IPurchasePlanningProvider provider)
-        {
-            try
-            {
-                proposals = await provider.GetPurchaseProposalsAsync(_selectedDate, deliveryDate,
-                    scheduled.Select(x => x.Supplier).Distinct(StringComparer.OrdinalIgnoreCase).ToList(), coverageDays);
-            }
-            catch (Exception exception)
-            {
-                MessageBox.Show($"Չհաջողվեց ստանալ պահեստի մնացորդները։\n{exception.Message}", "Վաղվա պատվերներ", MessageBoxButton.OK, MessageBoxImage.Warning);
-            }
-        }
-        return Views.PurchasePlan(_selectedDate, deliveryDate, scheduled, proposals);
+        return await SupplierEditorViewAsync(_selectedDate.AddDays(1));
     }
+
+    private async Task<UIElement> SupplierEditorViewAsync(DateOnly date)
+        => Views.Suppliers(PlannedSuppliersFor(date), _snapshot!.Suppliers, _partnerDebts,
+            _employeeSupplierActionStore.Load(), _supplierStatusChangeStore.Load(), _supplierNoteStore.Load(),
+            await BuildWeeklyFinancialPlanAsync(date), SaveSupplierWeekRow, ShowSupplierEmployeeStatus,
+            ShowSupplierDebtHistory, EditSupplierStatus, AddSupplierNoteFromDesktop, ShowSupplierAnalysis,
+            SaveAllSupplierRowsAsync, _supplierInputDrafts, _supplierSaveStatus);
 
     private async Task<IReadOnlyList<PurchaseProposal>> GetOrBuildPurchaseProposalsAsync(DateOnly planningDate, DateOnly deliveryDate, IReadOnlyList<SupplierWeekPlanRow> scheduled, bool showErrors = false)
     {
@@ -1909,8 +3104,8 @@ public partial class MainWindow : Window
         {
             // Keep the token locally even if the owner has not yet pressed /start.
             // The next Telegram click can then simply retry chat discovery.
-            _telegramBotSettingsStore.Save(window.Result);
-            var chatId = await TelegramBotClient.FindChatIdAsync(window.Result);
+            var configured = _telegramBotSettingsStore.Configure(window.Result.BotToken);
+            var chatId = configured.ChatId ?? await TelegramBotClient.FindChatIdAsync(configured);
             if (string.IsNullOrWhiteSpace(chatId))
             {
                 MessageBox.Show("Բոտին Telegram-ում ուղարկեք /start, ապա կրկին սեղմեք «Telegram» կոճակը։ Այս պահին անձնական չաթ չի գտնվել։",
@@ -1918,8 +3113,9 @@ public partial class MainWindow : Window
                 return;
             }
 
-            var settings = window.Result with { ChatId = chatId };
+            var settings = _telegramBotSettingsStore.Load() with { ChatId = chatId };
             _telegramBotSettingsStore.Save(settings);
+            StartTelegramPolling();
             await TelegramBotClient.SendMessageAsync(settings, "✅ Patarik AI OS-ի Telegram կապը հաստատվեց։ Երեկոյան այստեղ կստանաք վաղվա պատվերների և վճարումների նախագիծը։");
             MessageBox.Show("Telegram կապը հաստատվեց։ Փորձնական հաղորդագրությունն ուղարկվել է ձեր բոտին։", "Telegram", MessageBoxButton.OK, MessageBoxImage.Information);
         }
@@ -1933,7 +3129,7 @@ public partial class MainWindow : Window
     {
         var window = new EmployeeTelegramBotSettingsWindow(_employeeTelegramBotSettingsStore.Load()) { Owner = this };
         if (window.ShowDialog() != true || window.Result is null) return;
-        _employeeTelegramBotSettingsStore.Save(window.Result);
+        _employeeTelegramBotSettingsStore.Configure(window.Result.BotUsername, window.Result.BotToken);
         StartEmployeeTelegramPolling();
         MessageBox.Show($"Աշխատակիցների բոտի կարգավորումները պահպանվել են։\n\nԲոտ՝ {window.Result.BotUsername}\n\nՀաջորդ քայլը՝ յուրաքանչյուր աշխատակից պետք է այս բոտին գրի /start, հետո նրանց կհանձնարարենք դերեր և պատվերներ։",
             "Աշխատակիցների բոտ", MessageBoxButton.OK, MessageBoxImage.Information);
@@ -1966,6 +3162,31 @@ public partial class MainWindow : Window
         await LoadAsync("Dashboard");
     }
 
+    private async void AddFundsTransaction_Click(object sender, RoutedEventArgs e)
+    {
+        var supplierNames = (_snapshot?.Suppliers.Select(x => x.Name) ?? [])
+            .Concat(_partnerDebts.Select(x => x.Supplier))
+            .Concat(SupplierWeekPlanSeed.AllSuppliers())
+            .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        var window = new FundsTransactionWindow(_selectedDate, supplierNames) { Owner = this };
+        if (window.ShowDialog() != true || window.Result is null) return;
+        var entry = window.Result;
+        var isTransfer = entry.Kind == "Ներքին փոխանցում";
+        var isSupplier = entry.Kind == "Մատակարարի վճարում";
+        var purpose = isTransfer
+            ? $"Ներքին փոխանցում՝ {FundsSourceLabel(entry.Source)} → {FundsSourceLabel(entry.Target!)}"
+            : isSupplier
+                ? $"մատակարար {entry.RecipientOrPurpose} {(entry.IsOldDebtPayment ? "հին" : "նոր")}" 
+                : entry.RecipientOrPurpose;
+        var category = isTransfer ? "Ներքին փոխանցում" : isSupplier ? "Մատակարարի վճարում" : InferPaymentCategory(entry.RecipientOrPurpose);
+        var transaction = new FundsTransaction(Guid.NewGuid(), entry.Date, entry.Source, entry.Amount, purpose,
+            category, entry.Target, DateTime.Now);
+        _fundsTransactions.Add(transaction);
+        _fundsTransactionStore.Save(_fundsTransactions);
+        if (isSupplier) ApplyManualSupplierPayment(transaction, entry.RecipientOrPurpose, entry.IsOldDebtPayment);
+        await LoadAsync(_currentPage);
+    }
+
     private void ApprovePendingSalaryEmployee(Guid id)
     {
         var pending = _pendingSalaryEmployees.FirstOrDefault(x => x.Id == id);
@@ -1988,8 +3209,8 @@ public partial class MainWindow : Window
     {
         var window = new SalaryEmployeeDetailsWindow(employee, SalaryRules.WeekStart(_selectedDate), _salaryAccruals, _salaryPayments, () =>
         {
-            _salaryStore.SaveAccruals(_salaryAccruals);
-            _salaryStore.SavePayments(_salaryPayments);
+            try { _salaryStore.SaveCorrection(_salaryAccruals,_salaryPayments); }
+            catch(Exception ex) { _salaryAccruals.Clear(); _salaryAccruals.AddRange(_salaryStore.LoadAccruals()); _salaryPayments.Clear(); _salaryPayments.AddRange(_salaryStore.LoadPayments()); MessageBox.Show(ex.Message,"Փոփոխությունը չի պահպանվել"); }
         }) { Owner = this };
         window.ShowDialog();
         _ = LoadAsync("Salaries");
@@ -2045,6 +3266,17 @@ public partial class MainWindow : Window
         try
         {
             var isXml = string.Equals(Path.GetExtension(picker.FileName), ".xml", StringComparison.OrdinalIgnoreCase);
+            if (!isXml)
+            {
+                var batch = ExcelReportReader.Read(picker.FileName);
+                var state = _excelImportStore.Load(); ExcelImportStore.Merge(state,batch);
+                var conflicts = ExcelReportReader.Reconcile(state);
+                if (conflicts.Count > 0) throw new InvalidOperationException(string.Join("\n",conflicts));
+                if (!ConfirmImportPreview(batch.FileName + "\nՆույն օրերի նախորդ ներմուծումը կփոխարինվի։\n" + string.Join("\n",batch.Warnings))) return;
+                _excelImportStore.Save(state); ConfigureDataProvider(); _snapshot = null;
+                _selectedDate = batch.Dates.Max(); ViewDatePicker.SelectedDate = _selectedDate.ToDateTime(TimeOnly.MinValue);
+                await LoadAsync("Dashboard"); return;
+            }
             var imported = isXml ? CashXmlImportService.Import(picker.FileName).ToList() : CashDocumentImportService.Import(picker.FileName).ToList();
             await ProcessCashImportAsync(imported, replaceDay: !isXml);
         }
@@ -2095,30 +3327,7 @@ public partial class MainWindow : Window
         await LoadAsync("Payments");
     }
 
-    private async void ImportWarehouse_Click(object sender, RoutedEventArgs e)
-    {
-        var picker = new Microsoft.Win32.OpenFileDialog { Title = "Ընտրեք ՀԾ-ից արտահանված ստացումների Excel ֆայլը", Filter = "Excel files (*.xlsx)|*.xlsx" };
-        if (picker.ShowDialog() != true) return;
-        try
-        {
-            var isXml = string.Equals(Path.GetExtension(picker.FileName), ".xml", StringComparison.OrdinalIgnoreCase);
-            var records = isXml ? CashXmlImportService.Import(picker.FileName).ToList() : CashDocumentImportService.Import(picker.FileName).ToList();
-            await ProcessCashImportAsync(records, replaceDay: !isXml);
-            return;
-        }
-        catch (InvalidOperationException) { }
-        try
-        {
-            _deliveryPatterns = WarehouseImportService.Import(picker.FileName).ToList();
-            _deliveryScheduleStore.Save(_deliveryPatterns);
-            await LoadAsync("DeliverySchedule");
-            MessageBox.Show($"Ներմուծվել է {_deliveryPatterns.Count} մատակարար-օրային կանոն։", "Ներմուծումը հաջող է", MessageBoxButton.OK, MessageBoxImage.Information);
-        }
-        catch (Exception exception)
-        {
-            MessageBox.Show($"Ֆայլը չհաջողվեց ներմուծել։\n{exception.Message}", "Ներմուծման սխալ", MessageBoxButton.OK, MessageBoxImage.Warning);
-        }
-    }
+    private void ImportWarehouse_Click(object sender, RoutedEventArgs e) => OpenExcelImports_Click(sender, e);
 
     private async void ChangeDeliveryPlan_Click(object sender, RoutedEventArgs e)
     {
@@ -2172,19 +3381,45 @@ public partial class MainWindow : Window
     }
 
     private async void SaveSupplierWeekRow(SupplierWeekPlanRow row, decimal order, decimal payment, decimal oldDebtPayment, decimal debt)
+        => await SaveAllSupplierRowsAsync([new SupplierRowEdit(row, order, payment, oldDebtPayment, debt)]);
+
+    private async Task SaveAllSupplierRowsAsync(IReadOnlyList<SupplierRowEdit> edits)
     {
         try
         {
-        var index = _supplierWeekRows.FindIndex(x => x.Date == row.Date && SupplierNamesMatch(x.Supplier, row.Supplier));
+        if (edits.Any(x => x.Order < 0 || x.Payment < 0 || x.OldDebtPayment < 0 || x.Debt < 0))
+            throw new InvalidOperationException("Գումարները չեն կարող բացասական լինել։");
+        var nextRows = _supplierWeekRows.ToList();
+        var history = new List<SupplierDebtChange>();
+        foreach (var edit in edits)
+        {
+        var (row, order, payment, oldDebtPayment, debt) = edit;
+        var index = nextRows.FindIndex(x => x.Date == row.Date && string.Equals(x.Supplier, row.Supplier, StringComparison.OrdinalIgnoreCase));
+        if (index >= 0 && (nextRows[index].OrderAmount != row.OrderAmount || nextRows[index].PaymentAmount != row.PaymentAmount || nextRows[index].OldDebtPayment != row.OldDebtPayment || nextRows[index].Debt != row.Debt && nextRows[index].HasActualDebt))
+            throw new InvalidOperationException($"{row.Supplier}․ տվյալները փոխվել են այլ գործողությամբ։ Թարմացրեք ցանկը և նորից պահպանեք։");
         // The debt field represents the closing balance for the selected day.  Only the change
         // made by the owner is applied, so pressing Save a second time cannot reduce it twice.
         var movementChange = (order - row.OrderAmount) - (payment - row.PaymentAmount) - (oldDebtPayment - row.OldDebtPayment);
         var closingDebt = Math.Max(0m, debt + movementChange);
-        var updated = row with { OrderAmount = order, PaymentAmount = payment, OldDebtPayment = oldDebtPayment, Debt = closingDebt };
-        if (index < 0) _supplierWeekRows.Add(updated);
-        else _supplierWeekRows[index] = updated;
-        _supplierWeekPlanStore.Save(_supplierWeekRows);
-        await LoadAsync("Suppliers");
+        var updated = row with { OrderAmount = order, PaymentAmount = payment, OldDebtPayment = oldDebtPayment, Debt = closingDebt, HasActualDebt = true };
+        if (index < 0) nextRows.Add(updated);
+        else nextRows[index] = updated;
+        if (closingDebt != row.Debt || !row.HasActualDebt)
+        {
+            var reason = debt != row.Debt || order == row.OrderAmount && payment == row.PaymentAmount && oldDebtPayment == row.OldDebtPayment
+                ? "Տնօրենի կողմից պարտքի հիմքային մնացորդի ուղղում"
+                : "Պատվերի կամ վճարման փոփոխության արդյունքում վերահաշվարկ";
+            history.Add(new SupplierDebtChange(Guid.NewGuid(), row.Date, row.Supplier,
+                row.Debt, closingDebt, reason, DateTime.Now, "Տնօրեն"));
+        }
+        }
+        _supplierWeekPlanStore.Save(nextRows);
+        _supplierWeekRows = nextRows;
+        foreach (var edit in edits) _supplierInputDrafts.Remove($"{edit.Row.Date:yyyyMMdd}|{edit.Row.Supplier}");
+        _supplierDebtHistory.AddRange(history);
+        _supplierDebtHistoryStore.Save(_supplierDebtHistory);
+        _supplierSaveStatus = $"✓ Պահպանված է {edits.Count} տող · {DateTime.Now:HH:mm:ss}։ Սա չի նշանակում մատակարարման ստացման հաստատում։";
+        await LoadAsync(_currentPage == "PurchasePlan" ? "PurchasePlan" : "Suppliers");
         }
         catch (Exception exception)
         {
@@ -2289,10 +3524,12 @@ public partial class MainWindow : Window
         return _snapshot?.Suppliers.FirstOrDefault(x => SupplierNamesMatch(x.Name, supplier))?.Debt ?? 0m;
     }
 
-    private CashDailySummary? CashSummaryForSelectedDate() =>
-        _cashDocuments.Any(x => x.Date == _selectedDate)
-            ? CashDocumentImportService.Summary(_cashDocuments, _selectedDate)
-            : null;
+    private CashDailySummary? CashSummaryForSelectedDate()
+    {
+        var source = App.Services.DataProvider is ExcelDataProvider
+            ? _excelImportStore.Load().Batches.SelectMany(x => x.Cash).ToList() : _cashDocuments;
+        return source.Any(x => x.Date == _selectedDate) ? CashDocumentImportService.Summary(source,_selectedDate) : null;
+    }
 
     private bool IsKnownSupplier(string name) =>
         _supplierWeekRows.Any(x => SupplierNamesMatch(x.Supplier, name)) ||

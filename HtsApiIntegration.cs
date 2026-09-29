@@ -42,25 +42,33 @@ public sealed class HtsApiSettingsStore
 
 public sealed record HtsConnectionTestResult(bool Success, string Message);
 
-public sealed class HtsApiDataProvider(HtsApiSettings settings) : IHtsDataProvider, IBusinessSummaryProvider, IFundsMovementProvider, IPurchasePlanningProvider, ISupplierSalesAnalysisProvider
+public sealed class HtsApiDataProvider(HtsApiSettings settings, Func<HttpClient>? clientFactory = null) : IHtsDataProvider, IBusinessSummaryProvider, IFundsMovementProvider, ICashDocumentProvider, IPurchasePlanningProvider, ISupplierSalesAnalysisProvider, ISupplierActivityProvider
 {
     private readonly HtsApiSettings _settings = settings;
+    private HttpClient NewClient() => clientFactory?.Invoke() ?? CreateClient(_settings);
+    public string? LastCashWarning { get; private set; }
 
     public async Task<DashboardSnapshot> GetSnapshotAsync(DateOnly date, CancellationToken cancellationToken = default)
     {
-        using var client = CreateClient(_settings);
+        using var client = NewClient();
         var previousDate = date.AddDays(-1);
-        var todaySalesTask = GetSalesRowsAsync(client, date, cancellationToken);
-        var previousSalesTask = GetSalesRowsAsync(client, previousDate, cancellationToken);
-        var balancesTask = GetPartnerBalancesAsync(client, date, cancellationToken);
+        var warnings = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        var todaySalesTask = CaptureReportAsync(() => GetSalesRowsAsync(client, date, cancellationToken), warnings);
+        var previousSalesTask = CaptureReportAsync(() => GetSalesRowsAsync(client, previousDate, cancellationToken), warnings);
+        var balancesTask = CaptureReportAsync(() => GetPartnerBalancesAsync(client, date, cancellationToken), warnings);
         await Task.WhenAll(todaySalesTask, previousSalesTask, balancesTask);
 
-        var todaySales = ToSalesSummary(todaySalesTask.Result, previousSalesTask.Result);
+        var todaySales = ToSalesSummary(todaySalesTask.Result ?? [], previousSalesTask.Result ?? []) with
+        {
+            SalesAvailable = todaySalesTask.Result is not null && HasAmounts(todaySalesTask.Result, "saleAmountWithVAT"),
+            CostAvailable = todaySalesTask.Result is not null && HasAmounts(todaySalesTask.Result, "costAmountWithVAT"),
+            ComparisonAvailable = previousSalesTask.Result is not null && HasAmounts(previousSalesTask.Result, "costAmountWithVAT") && HasAmounts(previousSalesTask.Result, "saleAmountWithVAT"),
+            DataWarning = warnings.IsEmpty ? null : string.Join("\n", warnings)
+        };
         var partnerRows = await GetSupplierPartnersSafeAsync(client, cancellationToken);
-        var apiSuppliers = ToSuppliers(balancesTask.Result, partnerRows, date);
-        List<JsonElement> documentRows;
-        try { documentRows = await GetDocumentsAsync(client, date, date, cancellationToken); }
-        catch { documentRows = []; }
+        var apiSuppliers = ToSuppliers(balancesTask.Result ?? [], partnerRows, date);
+        var documentRows = await CaptureReportAsync(() => GetDocumentsAsync(client, date, date, cancellationToken), warnings) ?? [];
+        todaySales = todaySales with { DataWarning = warnings.IsEmpty ? null : string.Join("\n", warnings) };
         var dailyMovements = ToSupplierDailyMovements(documentRows, apiSuppliers, date);
 
         return new DashboardSnapshot
@@ -82,20 +90,21 @@ public sealed class HtsApiDataProvider(HtsApiSettings settings) : IHtsDataProvid
 
     public async Task<BusinessSummary> GetBusinessSummaryAsync(DateOnly startDate, DateOnly endDate, CancellationToken cancellationToken = default)
     {
-        using var client = CreateClient(_settings);
+        using var client = NewClient();
         var days = endDate.DayNumber - startDate.DayNumber + 1;
         var previousStart = startDate.AddDays(-days);
         var previousEnd = startDate.AddDays(-1);
-        var rowsTask = GetSalesRowsAsync(client, startDate, endDate, cancellationToken);
-        var previousTask = GetSalesRowsAsync(client, previousStart, previousEnd, cancellationToken);
-        var documentsTask = GetDocumentsAsync(client, startDate, endDate, cancellationToken);
+        var warnings = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        var rowsTask = CaptureReportAsync(() => GetSalesRowsAsync(client, startDate, endDate, cancellationToken), warnings);
+        var previousTask = CaptureReportAsync(() => GetSalesRowsAsync(client, previousStart, previousEnd, cancellationToken), warnings);
+        var documentsTask = CaptureReportAsync(() => GetDocumentsAsync(client, startDate, endDate, cancellationToken), warnings);
         await Task.WhenAll(rowsTask, previousTask, documentsTask);
 
-        var candidates = documentsTask.Result
+        var candidates = (documentsTask.Result ?? [])
             .Where(row => !string.IsNullOrWhiteSpace(Text(row, "partnerName")) && !string.IsNullOrWhiteSpace(Text(row, "storageName")))
             .ToList();
         var identifiedReceipts = candidates.Where(IsSupplyDocument).ToList();
-        var receiptRows = identifiedReceipts.Count > 0 ? identifiedReceipts : candidates;
+        var receiptRows = identifiedReceipts;
         var supplies = receiptRows
             .GroupBy(row => new
             {
@@ -105,12 +114,19 @@ public sealed class HtsApiDataProvider(HtsApiSettings settings) : IHtsDataProvid
             .Select(group => new SupplyByStorage(group.Key.Storage, group.Sum(row => Number(row, "amount")), group.Key.Production))
             .ToList();
 
-        return new BusinessSummary(startDate, endDate, ToSalesSummary(rowsTask.Result, previousTask.Result), [], supplies, 0m, 0m);
+        var sales = ToSalesSummary(rowsTask.Result ?? [], previousTask.Result ?? []) with
+        {
+            SalesAvailable = rowsTask.Result is not null && HasAmounts(rowsTask.Result, "saleAmountWithVAT"),
+            CostAvailable = rowsTask.Result is not null && HasAmounts(rowsTask.Result, "costAmountWithVAT"),
+            ComparisonAvailable = previousTask.Result is not null && HasAmounts(previousTask.Result, "saleAmountWithVAT") && HasAmounts(previousTask.Result, "costAmountWithVAT"),
+            DataWarning = warnings.IsEmpty ? null : string.Join("\n", warnings)
+        };
+        return new BusinessSummary(startDate, endDate, sales, [], supplies, 0m, 0m);
     }
 
     public async Task<BankSalesBreakdown> GetNonCashSalesAsync(DateOnly startDate, DateOnly endDate, CancellationToken cancellationToken = default)
     {
-        using var client = CreateClient(_settings);
+        using var client = NewClient();
         var rows = await GetEcrChecksAsync(client, startDate, endDate, cancellationToken);
         decimal report = 0m, ameria = 0m, idram = 0m;
         foreach (var row in rows)
@@ -125,6 +141,32 @@ public sealed class HtsApiDataProvider(HtsApiSettings settings) : IHtsDataProvid
         return new BankSalesBreakdown(report, ameria, idram);
     }
 
+    public async Task<IReadOnlyList<CashDocumentRecord>> GetCashDocumentsAsync(DateOnly startDate, DateOnly endDate, CancellationToken cancellationToken = default)
+    {
+        using var client = NewClient();
+        var warnings = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        var documents = await CaptureReportAsync(() => GetDocumentsAsync(client, startDate, endDate, cancellationToken), warnings);
+        var result = (documents ?? [])
+            .Where(IsCashDocument)
+            .Select(row => ToCashDocumentRecord(row, startDate))
+            .Where(x => x.Amount > 0m && x.Date >= startDate && x.Date <= endDate)
+            .ToList();
+        // This feed contains only registered sales/returns, not cash orders.
+        // Retain explicit zero days so a verified no-sale day differs from a failed load.
+        var checks = await CaptureReportAsync(() => GetEcrChecksAsync(client, startDate, endDate, cancellationToken), warnings);
+        if (checks is not null && !HasAmounts(checks, "cashAmount"))
+        { warnings.Enqueue("ՀԾ կտրոններում կանխիկ վճարման գումարը բացակայում է։"); checks = null; }
+        LastCashWarning = warnings.IsEmpty ? null : string.Join("\n", warnings);
+        if (documents is null && checks is null) throw new InvalidOperationException(LastCashWarning);
+        for (var date = startDate; checks is not null && date <= endDate; date = date.AddDays(1))
+        {
+            var cash = checks.Where(x => DocumentDate(x) == date).Sum(x => Number(x, "cashAmount"));
+            result.Add(new CashDocumentRecord(date, $"HTS-CASH-SALES-{date:yyyyMMdd}", "ecr-cash-sales", cash,
+                "ՀԴՄ կանխիկ վաճառք՝ հանած կանխիկ վերադարձները", "", "0001", "", ""));
+        }
+        return result;
+    }
+
     public async Task<IReadOnlyList<PurchaseProposal>> GetPurchaseProposalsAsync(
         DateOnly stockDate,
         DateOnly deliveryDate,
@@ -133,7 +175,7 @@ public sealed class HtsApiDataProvider(HtsApiSettings settings) : IHtsDataProvid
         CancellationToken cancellationToken = default)
     {
         if (scheduledSuppliers.Count == 0) return [];
-        using var client = CreateClient(_settings);
+        using var client = NewClient();
         var balanceRowsTask = GetProductsBalancesAsync(client, stockDate, cancellationToken);
         var salesRowsTask = GetSalesRowsAsync(client, stockDate.AddDays(-6), stockDate, cancellationToken);
         await Task.WhenAll(balanceRowsTask, salesRowsTask);
@@ -148,6 +190,15 @@ public sealed class HtsApiDataProvider(HtsApiSettings settings) : IHtsDataProvid
             .Where(x => !string.IsNullOrWhiteSpace(x.Supplier) && !string.IsNullOrWhiteSpace(x.Product))
             .GroupBy(x => $"{SupplierKey(x.Supplier)}|{ProductKey(x.Product)}")
             .ToDictionary(x => x.Key, x => x.Sum(item => item.Quantity));
+        // The owner asked for a small monetary safety reserve (about 1–2k AMD)
+        // per supplier order, not a retail-price based uplift.  The reserve is
+        // divided across that supplier's candidate products and then converted
+        // into units using the HTS receipt/unit cost.
+        var productCountBySupplier = rows
+            .Select(row => Text(row, "partySupplierName") ?? string.Empty)
+            .Where(supplier => scheduledSuppliers.Any(x => SupplierMatches(x, supplier)))
+            .GroupBy(SupplierKey)
+            .ToDictionary(group => group.Key, group => Math.Max(1, group.Count()));
         return rows.Select(row =>
         {
             var supplier = Text(row, "partySupplierName") ?? string.Empty;
@@ -160,17 +211,21 @@ public sealed class HtsApiDataProvider(HtsApiSettings settings) : IHtsDataProvid
             var productForSales = Text(row, "name") ?? Text(row, "fullName") ?? string.Empty;
             var salesQuantity = salesBySupplierAndProduct.GetValueOrDefault($"{SupplierKey(supplier)}|{ProductKey(productForSales)}");
             var coverageDays = Math.Clamp(supplierCoverageDays.GetValueOrDefault(plannedSupplier, 3), 1, 30);
-            // The first-order quantity covers expected sales until the next scheduled delivery,
-            // with a 15% safety buffer. HTS's own suggested quantity remains a lower bound.
-            var salesBasedQuantity = Math.Max(0m, salesQuantity / 7m * coverageDays * 1.15m - quantity);
+            var unitCost = Number(row, "costPriceWithVAT");
+            if (unitCost <= 0m && quantity > 0m) unitCost = Number(row, "costAmountWithVAT") / quantity;
+            var supplierProductCount = productCountBySupplier.GetValueOrDefault(SupplierKey(supplier), 1);
+            var safetyAmountPerProduct = 1_500m / supplierProductCount;
+            var safetyQuantity = unitCost > 0m ? Math.Ceiling(safetyAmountPerProduct / unitCost) : 0m;
+            // The proposal starts from recent sales at supplier cost, adds the
+            // shared 1,500 AMD safety margin, then deducts physical stock.
+            // It never uses retail selling prices.
+            var salesBasedQuantity = Math.Max(0m, salesQuantity + safetyQuantity - quantity);
             var proposed = Number(row, "orderQuantity");
             proposed = Math.Max(proposed, salesBasedQuantity);
             if (proposed <= 0m && minimum > 0m && quantity <= minimum)
                 proposed = Math.Max(0m, (maximum > minimum ? maximum : minimum * 2m) - quantity);
             if (proposed <= 0m) return null;
 
-            var unitCost = Number(row, "costPriceWithVAT");
-            if (unitCost <= 0m && quantity > 0m) unitCost = Number(row, "costAmountWithVAT") / quantity;
             var product = Text(row, "name") ?? Text(row, "fullName") ?? "Ապրանք";
             var storage = Text(row, "storageName") ?? "Պահեստ";
             var unit = Text(row, "unitMeasureAbbreviation") ?? Text(row, "unitMeasure") ?? "հատ";
@@ -189,18 +244,23 @@ public sealed class HtsApiDataProvider(HtsApiSettings settings) : IHtsDataProvid
         DateOnly endDate,
         CancellationToken cancellationToken = default)
     {
-        using var client = CreateClient(_settings);
+        using var client = NewClient();
         var rows = await GetSalesRowsAsync(client, startDate, endDate, cancellationToken);
+        var partners = await GetSupplierPartnersSafeAsync(client, cancellationToken);
+        var namesById = partners.Where(x => !string.IsNullOrWhiteSpace(Text(x, "name")) && Text(x, "id") is not null)
+            .GroupBy(x => Text(x, "id")!).ToDictionary(x => x.Key, x => Text(x.First(), "name")!);
 
         return rows
             .Select(row => new
             {
-                Supplier = Text(row, "partySupplierName")?.Trim(),
+                Supplier = TextAny(row, "partySupplierName")?.Trim()
+                    ?? (namesById.TryGetValue(Text(row, "partySupplierId") ?? "", out var name) ? name : "Չկապակցված մատակարար"),
                 Product = Text(row, "itemName") ?? Text(row, "name") ?? string.Empty,
                 Storage = Text(row, "storageName") ?? string.Empty,
                 Sales = Number(row, "saleAmountWithVAT"),
                 Cost = Number(row, "costAmountWithVAT"),
-                Quantity = Number(row, "quantity")
+                Quantity = Number(row, "quantity"),
+                CostAvailable = HasAmounts([row], "costAmountWithVAT")
             })
             .Where(x => !string.IsNullOrWhiteSpace(x.Supplier))
             .GroupBy(x => x.Supplier!, StringComparer.OrdinalIgnoreCase)
@@ -210,8 +270,35 @@ public sealed class HtsApiDataProvider(HtsApiSettings settings) : IHtsDataProvid
                 group.Sum(x => x.Cost),
                 group.Sum(x => x.Quantity),
                 group.Select(x => x.Product).Where(x => !string.IsNullOrWhiteSpace(x)).Distinct(StringComparer.OrdinalIgnoreCase).Count(),
-                group.Select(x => x.Storage).Where(x => !string.IsNullOrWhiteSpace(x)).Distinct(StringComparer.OrdinalIgnoreCase).Count()))
+                group.Select(x => x.Storage).Where(x => !string.IsNullOrWhiteSpace(x)).Distinct(StringComparer.OrdinalIgnoreCase).Count(),
+                group.All(x => x.CostAvailable)))
             .OrderByDescending(x => x.SalesAmount)
+            .ToList();
+    }
+
+    public async Task<IReadOnlyList<SupplierActivityLine>> GetSupplierActivityAsync(
+        string supplier, DateOnly startDate, DateOnly endDate, CancellationToken cancellationToken = default)
+    {
+        using var client = NewClient();
+        var documents = await GetDocumentsAsync(client, startDate, endDate, cancellationToken);
+        const decimal matchingTolerance = 10m;
+
+        return documents
+            .Select(row => new { Row = row, Partner = Text(row, "partnerName") ?? Text(row, "partner") ?? string.Empty })
+            .Where(item => SupplierMatches(item.Partner, supplier))
+            .Where(item => IsSupplyDocument(item.Row) || IsSupplierPaymentDocument(item.Row))
+            .GroupBy(item => DocumentDate(item.Row) ?? startDate)
+            .Select(group =>
+            {
+                var receipts = group.Where(item => IsSupplyDocument(item.Row)).Sum(item => Math.Abs(Number(item.Row, "amount")));
+                var payments = group.Where(item => IsSupplierPaymentDocument(item.Row)).Sum(item => Math.Abs(Number(item.Row, "amount")));
+                var paymentForOrder = receipts > 0m && payments > 0m && Math.Abs(receipts - payments) <= matchingTolerance ? payments : 0m;
+                var oldDebtPayment = paymentForOrder == 0m ? payments : 0m;
+                var documentsText = string.Join(", ", group.Select(item => Text(item.Row, "number") ?? Text(item.Row, "documentNumber") ?? "—").Distinct());
+                var description = string.Join("; ", group.Select(item => Text(item.Row, "typeName") ?? Text(item.Row, "type") ?? "Փաստաթուղթ").Distinct());
+                return new SupplierActivityLine(group.Key, receipts, paymentForOrder, oldDebtPayment, documentsText, description);
+            })
+            .OrderBy(item => item.Date)
             .ToList();
     }
 
@@ -238,6 +325,7 @@ public sealed class HtsApiDataProvider(HtsApiSettings settings) : IHtsDataProvid
             startDate = day,
             endDate = day,
             showSumsWithVAT = true,
+            showParties = true,
             showCostAndSalePrices = true
         }, cancellationToken);
         using var documents = await PostJsonAsync(client, "v1/journals/alldocuments", new
@@ -333,9 +421,10 @@ public sealed class HtsApiDataProvider(HtsApiSettings settings) : IHtsDataProvid
             showSumsWithoutVAT = false,
             showSumsWithVAT = true,
             showCostAndSalePrices = true,
+            showParties = true,
             showDiscounts = true
         }, cancellationToken);
-        return await ReadRowsAsync(response, "վաճառքի վերլուծություն", cancellationToken);
+        return await ReadRowsAsync(client, response, "վաճառքի վերլուծություն", cancellationToken);
     }
 
     private static async Task<List<JsonElement>> GetEcrChecksAsync(HttpClient client, DateOnly startDate, DateOnly endDate, CancellationToken cancellationToken)
@@ -346,9 +435,11 @@ public sealed class HtsApiDataProvider(HtsApiSettings settings) : IHtsDataProvid
             startDate = startDate.ToString("yyyy-MM-dd"),
             endDate = endDate.ToString("yyyy-MM-dd"),
             showPayments = true,
+            documentTypes = new[] { "18", "15", "38" },
+            documentState = 2,
             showOutputAmountsAsNegatives = true
         }, cancellationToken);
-        return await ReadRowsAsync(response, "ՀԴՄ կտրոններ", cancellationToken);
+        return await ReadRowsAsync(client, response, "ՀԴՄ կտրոններ", cancellationToken);
     }
 
     private static async Task<List<JsonElement>> GetDocumentsAsync(HttpClient client, DateOnly startDate, DateOnly endDate, CancellationToken cancellationToken)
@@ -356,10 +447,11 @@ public sealed class HtsApiDataProvider(HtsApiSettings settings) : IHtsDataProvid
         var response = await PostJsonAsync(client, "v1/journals/alldocuments", new
         {
             pageSize = 10000,
+            documentState = 2,
             startDate = startDate.ToString("yyyy-MM-dd"),
             endDate = endDate.ToString("yyyy-MM-dd")
         }, cancellationToken);
-        return await ReadRowsAsync(response, "փաստաթղթերի մատյան", cancellationToken);
+        return await ReadRowsAsync(client, response, "փաստաթղթերի մատյան", cancellationToken);
     }
 
     private static async Task<List<JsonElement>> GetProductsBalancesAsync(HttpClient client, DateOnly date, CancellationToken cancellationToken)
@@ -369,7 +461,7 @@ public sealed class HtsApiDataProvider(HtsApiSettings settings) : IHtsDataProvid
             pageSize = 10000,
             date = date.ToString("yyyy-MM-dd")
         }, cancellationToken);
-        return await ReadRowsAsync(response, "ապրանքների մնացորդներ", cancellationToken);
+        return await ReadRowsAsync(client, response, "ապրանքների մնացորդներ", cancellationToken);
     }
 
     private static async Task<List<JsonElement>> GetPartnerBalancesAsync(HttpClient client, DateOnly date, CancellationToken cancellationToken)
@@ -380,7 +472,7 @@ public sealed class HtsApiDataProvider(HtsApiSettings settings) : IHtsDataProvid
             date = date.ToString("yyyy-MM-dd"),
             openedByContracts = false
         }, cancellationToken);
-        return await ReadRowsAsync(response, "գործընկերների մնացորդներ", cancellationToken);
+        return await ReadRowsAsync(client, response, "գործընկերների մնացորդներ", cancellationToken);
     }
 
     private static async Task<List<JsonElement>> GetSupplierPartnersSafeAsync(HttpClient client, CancellationToken cancellationToken)
@@ -391,34 +483,65 @@ public sealed class HtsApiDataProvider(HtsApiSettings settings) : IHtsDataProvid
         try
         {
             var response = await PostJsonAsync(client, "v1/directories/partners/list", new { pageSize = 10000, extended = false }, cancellationToken);
-            return await ReadRowsAsync(response, "մատակարարների ցանկ", cancellationToken);
+            return await ReadRowsAsync(client, response, "մատակարարների ցանկ", cancellationToken);
         }
         catch { return []; }
     }
 
-    private static async Task<List<JsonElement>> ReadRowsAsync(HttpResponseMessage response, string reportName, CancellationToken cancellationToken)
+    private static async Task<List<JsonElement>> ReadRowsAsync(HttpClient client, HttpResponseMessage response, string reportName, CancellationToken cancellationToken)
     {
-        var content = await response.Content.ReadAsStringAsync(cancellationToken);
-        if (!response.IsSuccessStatusCode)
-            throw new InvalidOperationException($"ՀԾ API․ «{reportName}» հաշվետվությունը չբացվեց ({(int)response.StatusCode})։ Ստուգեք API օգտագործողի իրավունքները։");
-
-        using var document = JsonDocument.Parse(content);
-        if (!document.RootElement.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Array) return [];
-        return data.EnumerateArray().Select(x => x.Clone()).ToList();
+        var rows = new List<JsonElement>();
+        var nextUrl = response.RequestMessage?.RequestUri?.ToString().TrimEnd('/') + "/nextpage";
+        for (var page = 0; page < 1000; page++)
+        {
+            JsonElement? nextId = null;
+            using (response)
+            {
+                var content = await response.Content.ReadAsStringAsync(cancellationToken);
+                if (!response.IsSuccessStatusCode)
+                    throw new InvalidOperationException($"ՀԾ API․ «{reportName}» հաշվետվությունը չբացվեց ({(int)response.StatusCode})։ Ստուգեք API օգտագործողի իրավունքները։");
+                using var document = JsonDocument.Parse(content);
+                var root = document.RootElement;
+                if (!TryGetProperty(root, "data", out var data) || data.ValueKind != JsonValueKind.Array)
+                    throw new InvalidOperationException($"ՀԾ․ «{reportName}» պատասխանի կառուցվածքը ճանաչելի չէ։");
+                rows.AddRange(data.EnumerateArray().Select(x => x.Clone()));
+                if (!Bool(root, "hasMore")) return rows;
+                if (data.GetArrayLength() == 0 || !TryGetProperty(root, "id", out var id))
+                    throw new InvalidOperationException($"ՀԾ․ «{reportName}» հաջորդ էջը հնարավոր չէ բեռնել։");
+                nextId = id.Clone();
+            }
+            response = await PostJsonAsync(client, nextUrl!, new { id = nextId.Value, close = false }, cancellationToken);
+        }
+        response.Dispose();
+        throw new InvalidOperationException($"ՀԾ․ «{reportName}» հաշվետվության էջավորումը չի ավարտվել։");
     }
 
     private static SalesSummary ToSalesSummary(IReadOnlyList<JsonElement> rows, IReadOnlyList<JsonElement> previousRows)
     {
         decimal Amount(IEnumerable<JsonElement> source, string property) => source.Sum(row => Number(row, property));
         int Checks(IEnumerable<JsonElement> source) => source
-            .Select(row => Text(row, "ecrCheckNumber") ?? Text(row, "documentNumber") ?? Text(row, "isn") ?? Guid.NewGuid().ToString())
+            .Select(row => TextAny(row, "isn") ?? (TextAny(row, "ecrCheckNumber", "documentNumber") is { } number ? $"{Text(row, "date")}|{Text(row, "cashDesk")}|{number}" : null))
+            .Where(x => x is not null)
             .Distinct(StringComparer.OrdinalIgnoreCase).Count();
 
         var sales = Amount(rows, "saleAmountWithVAT");
         var cost = Amount(rows, "costAmountWithVAT");
         var previousSales = Amount(previousRows, "saleAmountWithVAT");
         var previousCost = Amount(previousRows, "costAmountWithVAT");
-        return new SalesSummary(sales, cost, Checks(rows), previousSales, previousSales - previousCost, Checks(previousRows));
+        return new SalesSummary(sales, cost, Checks(rows), previousSales, previousSales - previousCost, Checks(previousRows),
+            HasAmounts(rows, "saleAmountWithVAT"), HasAmounts(rows, "costAmountWithVAT"),
+            HasAmounts(previousRows, "saleAmountWithVAT") && HasAmounts(previousRows, "costAmountWithVAT"));
+    }
+
+    private static bool HasAmounts(IEnumerable<JsonElement> rows, string property) => rows.All(row =>
+        TryGetProperty(row, property, out var value) && (value.ValueKind == JsonValueKind.Number && value.TryGetDecimal(out _) ||
+        value.ValueKind == JsonValueKind.String && decimal.TryParse(value.GetString(), System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out _)));
+
+    private static async Task<List<JsonElement>?> CaptureReportAsync(Func<Task<List<JsonElement>>> load,
+        System.Collections.Concurrent.ConcurrentQueue<string> warnings)
+    {
+        try { return await load(); }
+        catch (Exception ex) when (ex is not OperationCanceledException) { warnings.Enqueue(ex.Message); return null; }
     }
 
     private static List<Supplier> ToSuppliers(IReadOnlyList<JsonElement> rows, DateOnly date) => rows
@@ -490,7 +613,7 @@ public sealed class HtsApiDataProvider(HtsApiSettings settings) : IHtsDataProvid
 
     private static decimal Number(JsonElement item, string property)
     {
-        if (!item.TryGetProperty(property, out var value)) return 0m;
+        if (!TryGetProperty(item, property, out var value)) return 0m;
         return value.ValueKind switch
         {
             JsonValueKind.Number when value.TryGetDecimal(out var number) => number,
@@ -500,10 +623,35 @@ public sealed class HtsApiDataProvider(HtsApiSettings settings) : IHtsDataProvid
     }
 
     private static string? Text(JsonElement item, string property) =>
-        item.TryGetProperty(property, out var value) && value.ValueKind is JsonValueKind.String ? value.GetString() : null;
+        TryGetProperty(item, property, out var value) ? value.ValueKind switch
+        { JsonValueKind.String => value.GetString(), JsonValueKind.Number => value.GetRawText(), _ => null } : null;
 
     private static bool Bool(JsonElement item, string property) =>
-        item.TryGetProperty(property, out var value) && value.ValueKind is JsonValueKind.True or JsonValueKind.False && value.GetBoolean();
+        TryGetProperty(item, property, out var value) && value.ValueKind is JsonValueKind.True or JsonValueKind.False && value.GetBoolean();
+
+    private static bool TryGetProperty(JsonElement item, string property, out JsonElement value)
+    {
+        if (item.TryGetProperty(property, out value)) return true;
+        if (item.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var candidate in item.EnumerateObject())
+            {
+                if (string.Equals(candidate.Name, property, StringComparison.OrdinalIgnoreCase))
+                {
+                    value = candidate.Value;
+                    return true;
+                }
+            }
+        }
+        value = default;
+        return false;
+    }
+
+    private static string? TextAny(JsonElement item, params string[] properties) =>
+        properties.Select(property => Text(item, property)).FirstOrDefault(value => !string.IsNullOrWhiteSpace(value));
+
+    private static decimal NumberAny(JsonElement item, params string[] properties) =>
+        properties.Select(property => Number(item, property)).FirstOrDefault(value => value != 0m);
 
     private static string SupplierKey(string value) => new(value.ToLowerInvariant().Where(char.IsLetterOrDigit).ToArray());
 
@@ -519,6 +667,8 @@ public sealed class HtsApiDataProvider(HtsApiSettings settings) : IHtsDataProvid
     {
         var name = Text(row, "typeName") ?? string.Empty;
         var type = Text(row, "type") ?? string.Empty;
+        if (type is "2" or "02" or "3" or "03" || type.Contains("cash", StringComparison.OrdinalIgnoreCase) ||
+            name.Contains("օրդեր", StringComparison.OrdinalIgnoreCase) || name.Contains("դրամարկղ", StringComparison.OrdinalIgnoreCase)) return false;
         if ((name.Contains("մուտք", StringComparison.OrdinalIgnoreCase) && !name.Contains("գումարի", StringComparison.OrdinalIgnoreCase)) ||
             name.Contains("ստացում", StringComparison.OrdinalIgnoreCase) ||
             type.Contains("storageinput", StringComparison.OrdinalIgnoreCase)) return true;
@@ -538,6 +688,60 @@ public sealed class HtsApiDataProvider(HtsApiSettings settings) : IHtsDataProvid
                type.Contains("cashoutput", StringComparison.OrdinalIgnoreCase) ||
                type.Contains("payment", StringComparison.OrdinalIgnoreCase) ||
                name.Contains("cash output", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsCashDocument(JsonElement row)
+    {
+        return CanonicalCashDocumentType(row) is not null;
+    }
+
+    private static CashDocumentRecord ToCashDocumentRecord(JsonElement row, DateOnly fallbackDate)
+    {
+        var canonicalType = CanonicalCashDocumentType(row) ?? string.Empty;
+        var visibleType = TextAny(row, "typeName", "documentTypeName", "type", "documentType") ?? canonicalType;
+        var information = TextAny(row, "description", "note", "information", "comment", "purpose") ?? string.Empty;
+        if (!string.IsNullOrWhiteSpace(visibleType) &&
+            !information.Contains(visibleType, StringComparison.OrdinalIgnoreCase))
+            information = string.IsNullOrWhiteSpace(information) ? visibleType : $"{visibleType}. {information}";
+
+        // Keep the canonical marker in Type. CashDocumentImportService uses it
+        // for reliable accounting even when the displayed Armenian name differs
+        // between ArmSoft installations.
+        return new CashDocumentRecord(
+            DocumentDate(row) ?? fallbackDate,
+            TextAny(row, "number", "documentNumber", "documentNo", "isn", "id") ?? Guid.NewGuid().ToString("N"),
+            $"{visibleType} | {canonicalType}",
+            Math.Abs(NumberAny(row, "amount", "documentAmount", "totalAmount", "sum", "outputAmount", "inputAmount")),
+            information,
+            TextAny(row, "partnerName", "partner", "recipientName", "recipient", "counterpartyName") ?? string.Empty,
+            TextAny(row, "cashDeskCode", "cashDesk", "cashbox", "cashBox", "cashRegisterCode") ?? "0001",
+            TextAny(row, "shift", "shiftNumber") ?? string.Empty,
+            TextAny(row, "employeeName", "userName", "authorName") ?? string.Empty);
+    }
+
+    private static string? CanonicalCashDocumentType(JsonElement row)
+    {
+        var type = string.Join(" ", new[] { "type", "typeName", "documentType", "documentTypeName" }.Select(x => Text(row, x)));
+        var information = TextAny(row, "description", "note", "information", "comment", "purpose") ?? string.Empty;
+        var value = $"{type} {information}".ToLowerInvariant();
+
+        if (value.Contains("cashtransfer") || value.Contains("գումարի ելք դեպի այլ դրամարկղ") ||
+            value.Contains("դրամարկղի մնացորդի փակում")) return "cashtransfer";
+        if (Text(row, "type") is "2" or "02") return "cashinput";
+        if (Text(row, "type") is "3" or "03") return "cashoutput";
+        if (value.Contains("cashinput") || value.Contains("մուտքի օրդեր") ||
+            value.Contains("գումարի մուտք") || value.Contains("դրամարկղ մուտք")) return "cashinput";
+        if (value.Contains("cashoutput") || value.Contains("ելքի օրդեր") ||
+            value.Contains("գումարի ելք") || value.Contains("դրամարկղ ելք")) return "cashoutput";
+        return null;
+    }
+
+    private static DateOnly? DocumentDate(JsonElement row)
+    {
+        var value = TextAny(row, "date", "documentDate", "operationDate", "dateCreated");
+        if (DateOnly.TryParse(value, out var date)) return date;
+        if (DateTime.TryParse(value, out var dateTime)) return DateOnly.FromDateTime(dateTime);
+        return null;
     }
 
     private static bool IsProductionSupply(JsonElement row)

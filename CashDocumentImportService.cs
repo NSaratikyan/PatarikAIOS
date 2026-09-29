@@ -74,7 +74,7 @@ public static class CashDocumentImportService
     }
 
     public static IEnumerable<CashDocumentRecord> SupplierPaymentRows(IEnumerable<CashDocumentRecord> source) =>
-        source.Where(x => IsExit(x) && !IsClosing(x) && !IsOtherExpense(x));
+        source.Where(x => (IsExit(x) || HasCanonicalType(x, "cashoutput")) && !IsCashTransfer(x) && !IsOtherExpense(x));
 
     /// <summary>
     /// Converts HԾ cash documents to movements of cash desks. Sales are received to 0001.
@@ -82,20 +82,29 @@ public static class CashDocumentImportService
     /// </summary>
     public static IEnumerable<CashLedgerMovement> CashDeskMovements(IEnumerable<CashDocumentRecord> source)
     {
-        foreach (var row in source)
+        var all = source.ToList();
+        var verifiedSalesDays = all.Where(x => x.Type == "ecr-cash-sales").Select(x => x.Date).ToHashSet();
+        foreach (var row in all)
         {
             var cashDesk = CashDeskCode(row.CashBox, "0001");
-            if (IsSale(row))
+            if (row.Type == "ecr-cash-sales")
             {
+                yield return new CashLedgerMovement(row.Date, row.Amount < 0 ? "0001" : "", row.Amount < 0 ? null : "0001",
+                    Math.Abs(row.Amount), row.DocumentNumber, row.Recipient, row.Information, false);
+                continue;
+            }
+            if (IsSale(row) || HasCanonicalType(row, "sale"))
+            {
+                if (verifiedSalesDays.Contains(row.Date)) continue;
                 yield return new CashLedgerMovement(row.Date, string.Empty, "0001", row.Amount, row.DocumentNumber, row.Recipient, row.Information, false);
                 continue;
             }
-            if (IsInput(row))
+            if (IsInput(row) || HasCanonicalType(row, "cashinput"))
             {
                 yield return new CashLedgerMovement(row.Date, string.Empty, cashDesk, row.Amount, row.DocumentNumber, row.Recipient, row.Information, false);
                 continue;
             }
-            if (!IsExit(row)) continue;
+            if (!IsExit(row) && !HasCanonicalType(row, "cashoutput") && !HasCanonicalType(row, "cashtransfer")) continue;
             var transfer = IsCashTransfer(row);
             var target = transfer ? TargetCashDesk(row, cashDesk) : null;
             yield return new CashLedgerMovement(row.Date, cashDesk, target, row.Amount, row.DocumentNumber, row.Recipient, row.Information, transfer);
@@ -108,7 +117,8 @@ public static class CashDocumentImportService
     private static bool IsClosing(CashDocumentRecord row) => Normalize(row.Information).Contains("մնացորդիփակում");
     private static bool IsOtherExpense(CashDocumentRecord row) => Normalize(row.Information).Contains("այլծախս");
     private static bool IsCashTransfer(CashDocumentRecord row) =>
-        IsClosing(row) || Normalize(row.Type).Contains("գումարիելքդեպիայլդրամարկղ");
+        IsClosing(row) || HasCanonicalType(row, "cashtransfer") ||
+        Normalize(row.Type).Contains("գումարիելքդեպիայլդրամարկղ");
     private static string TargetCashDesk(CashDocumentRecord row, string source)
     {
         var match = Regex.Match(row.Information ?? string.Empty, @"\b\d{4}\b");
@@ -117,9 +127,11 @@ public static class CashDocumentImportService
     }
     private static string CashDeskCode(string value, string fallback)
     {
-        var match = Regex.Match(value ?? string.Empty, @"\d{4}");
-        return match.Success ? match.Value : fallback;
+        var match = Regex.Match(value ?? string.Empty, @"\b\d{1,4}\b");
+        return match.Success ? match.Value.PadLeft(4, '0') : fallback;
     }
+    private static bool HasCanonicalType(CashDocumentRecord row, string type) =>
+        (row.Type ?? string.Empty).Contains(type, StringComparison.OrdinalIgnoreCase);
     private static int Column(IReadOnlyDictionary<string, int> headers, string startsWith, bool optional = false)
     {
         var value = headers.FirstOrDefault(x => x.Key.StartsWith(startsWith, StringComparison.Ordinal)).Value;
@@ -128,18 +140,18 @@ public static class CashDocumentImportService
         throw new InvalidOperationException($"Չգտնվեց «{startsWith}» սյունակը։");
     }
     private static string Normalize(string value) => new string(value.ToLowerInvariant().Where(char.IsLetterOrDigit).ToArray());
-    private static XDocument LoadXml(ZipArchive archive, string path)
+    internal static XDocument LoadXml(ZipArchive archive, string path)
     {
         var entry = archive.GetEntry(path) ?? throw new InvalidOperationException($"Excel ֆայլում չի գտնվել {path}");
         using var stream = entry.Open(); return XDocument.Load(stream);
     }
-    private static List<string> ReadSharedStrings(ZipArchive archive, XNamespace ns)
+    internal static List<string> ReadSharedStrings(ZipArchive archive, XNamespace ns)
     {
         var entry = archive.GetEntry("xl/sharedStrings.xml"); if (entry is null) return [];
         using var stream = entry.Open();
         return XDocument.Load(stream).Descendants(ns + "si").Select(x => string.Concat(x.Descendants(ns + "t").Select(t => t.Value))).ToList();
     }
-    private static List<string> ReadRow(XElement row, XNamespace ns, IReadOnlyList<string> shared)
+    internal static List<string> ReadRow(XElement row, XNamespace ns, IReadOnlyList<string> shared)
     {
         var result = new List<string>();
         foreach (var cell in row.Elements(ns + "c"))
@@ -155,12 +167,12 @@ public static class CashDocumentImportService
         var index = 0; foreach (var c in reference.TakeWhile(char.IsLetter)) index = index * 26 + char.ToUpperInvariant(c) - 'A' + 1; return index - 1;
     }
     private static string Cell(IReadOnlyList<string> row, int column) => column >= 0 && column < row.Count ? row[column] : string.Empty;
-    private static DateOnly? ReadDate(string value)
+    internal static DateOnly? ReadDate(string value)
     {
         if (double.TryParse(value, NumberStyles.Any, CultureInfo.InvariantCulture, out var serial) && serial > 20000) return DateOnly.FromDateTime(DateTime.FromOADate(serial));
         return DateTime.TryParse(value, out var date) ? DateOnly.FromDateTime(date) : null;
     }
-    private static decimal? ReadAmount(string value) => decimal.TryParse(value, NumberStyles.Any, CultureInfo.InvariantCulture, out var amount) || decimal.TryParse(value, out amount) ? amount : null;
+    internal static decimal? ReadAmount(string value) => decimal.TryParse(value, NumberStyles.Any, CultureInfo.InvariantCulture, out var amount) || decimal.TryParse(value, out amount) ? amount : null;
 }
 
 public sealed class LocalCashDocumentStore
@@ -183,7 +195,11 @@ public sealed class LocalCashDocumentStore
     {
         foreach (var row in imported)
         {
-            if (!all.Any(x => x.Date == row.Date && x.DocumentNumber == row.DocumentNumber && x.Type == row.Type)) all.Add(row);
+            var index = all.FindIndex(x => x.Date == row.Date && x.DocumentNumber == row.DocumentNumber &&
+                x.Type.Split('|')[0].Trim().Equals(row.Type.Split('|')[0].Trim(), StringComparison.OrdinalIgnoreCase) &&
+                x.CashBox.Trim().PadLeft(4, '0') == row.CashBox.Trim().PadLeft(4, '0'));
+            if (index < 0) all.Add(row);
+            else all[index] = row;
         }
         Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
         File.WriteAllText(_path, JsonSerializer.Serialize(all, new JsonSerializerOptions { WriteIndented = true }));

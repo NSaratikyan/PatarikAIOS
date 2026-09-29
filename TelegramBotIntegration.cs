@@ -13,9 +13,21 @@ public sealed record TelegramBotSettings(string BotToken, string? ChatId = null,
 
 public sealed class TelegramBotSettingsStore
 {
-    private readonly string _path = Path.Combine(
+    private readonly string _path;
+
+    public TelegramBotSettingsStore(string? path = null) => _path = path ?? Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "PatarikAIOS", "telegram-settings.json");
+
+    public TelegramBotSettings Configure(string token)
+    {
+        var current = Load();
+        var updated = TelegramBotIdentity.IsSameBot(current.BotToken, token)
+            ? current with { BotToken = token }
+            : new TelegramBotSettings(token);
+        Save(updated);
+        return updated;
+    }
 
     public TelegramBotSettings Load()
     {
@@ -44,9 +56,21 @@ public sealed record EmployeeTelegramBotSettings(string BotUsername, string BotT
 
 public sealed class EmployeeTelegramBotSettingsStore
 {
-    private readonly string _path = Path.Combine(
+    private readonly string _path;
+
+    public EmployeeTelegramBotSettingsStore(string? path = null) => _path = path ?? Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "PatarikAIOS", "employee-telegram-settings.json");
+
+    public EmployeeTelegramBotSettings Configure(string username, string token)
+    {
+        var current = Load();
+        var updated = TelegramBotIdentity.IsSameBot(current.BotToken, token)
+            ? current with { BotUsername = username, BotToken = token }
+            : new EmployeeTelegramBotSettings(username, token);
+        Save(updated);
+        return updated;
+    }
 
     public EmployeeTelegramBotSettings Load()
     {
@@ -64,6 +88,19 @@ public sealed class EmployeeTelegramBotSettingsStore
         Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
         File.WriteAllText(_path, JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true }));
     }
+}
+
+public static class TelegramBotIdentity
+{
+    // Only the numeric bot ID is used in task history; never persist a token there.
+    public static string BotId(string token) => token.Split(':', 2)[0];
+
+    public static bool IsSameBot(string previous, string next) =>
+        !string.IsNullOrWhiteSpace(previous) && !string.IsNullOrWhiteSpace(next) &&
+        (string.Equals(previous, next, StringComparison.Ordinal) ||
+         (previous.Contains(':') && next.Contains(':') &&
+          long.TryParse(BotId(previous), out var previousId) &&
+          long.TryParse(BotId(next), out var nextId) && previousId == nextId));
 }
 
 public sealed record EmployeeBotUser(string ChatId, string DisplayName, DateTime RegisteredAt, DateTime LastSeenAt);
@@ -139,7 +176,16 @@ public sealed record PendingEmployeeOrderChange(
     string ReportedByName,
     DateTime CreatedAt,
     decimal PlannedOldDebtPayment = 0m,
-    decimal ActualOldDebtPayment = 0m);
+    decimal ActualOldDebtPayment = 0m,
+    bool RequiresSupplierReview = false,
+    string? OriginalSupplier = null,
+    IReadOnlyList<string>? SuggestedSuppliers = null,
+    int Revision = 0,
+    IReadOnlyList<PendingOrderCorrection>? Corrections = null);
+
+public sealed record PendingOrderCorrection(DateTime At, string PreviousSupplier, string Supplier,
+    decimal PreviousOrder, decimal Order, decimal PreviousPayment, decimal Payment,
+    decimal PreviousOldDebtPayment, decimal OldDebtPayment, string EditedBy);
 
 public sealed class PendingEmployeeOrderChangeStore
 {
@@ -189,11 +235,113 @@ public sealed class EmployeePendingIssueStore
     }
 }
 
-public sealed record EmployeeTask(Guid Id, DateOnly Date, string Description, DateTime CreatedAt);
+/// <summary>
+/// Stable binding between an employee's Telegram button and the supplier it
+/// represents.  Callback data cannot safely carry Armenian supplier names and
+/// an index can point to another supplier when the plan changes meanwhile.
+/// </summary>
+public sealed record EmployeeSupplierSelection(
+    Guid Id,
+    string ChatId,
+    DateOnly Date,
+    string Supplier,
+    string Workflow,
+    string Action,
+    DateTime CreatedAt);
+
+public sealed class EmployeeSupplierSelectionStore
+{
+    private readonly string _path = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "PatarikAIOS", "employee-supplier-selections.json");
+
+    public List<EmployeeSupplierSelection> Load()
+    {
+        try
+        {
+            if (File.Exists(_path))
+                return JsonSerializer.Deserialize<List<EmployeeSupplierSelection>>(File.ReadAllText(_path)) ?? [];
+        }
+        catch (JsonException) { }
+        return [];
+    }
+
+    public void Save(IEnumerable<EmployeeSupplierSelection> items)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
+        File.WriteAllText(_path, JsonSerializer.Serialize(items, new JsonSerializerOptions { WriteIndented = true }));
+    }
+}
+
+/// <summary>A dated note attached to one supplier delivery/ordering row.</summary>
+public sealed record SupplierNote(
+    Guid Id,
+    DateOnly Date,
+    string Supplier,
+    string Text,
+    string Author,
+    bool IsDirectorNote,
+    DateTime CreatedAt);
+
+public sealed class SupplierNoteStore
+{
+    private readonly string _path = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "PatarikAIOS", "supplier-notes.json");
+
+    public List<SupplierNote> Load()
+    {
+        try
+        {
+            if (File.Exists(_path))
+                return JsonSerializer.Deserialize<List<SupplierNote>>(File.ReadAllText(_path)) ?? [];
+        }
+        catch (JsonException) { }
+        return [];
+    }
+
+    public void Save(IEnumerable<SupplierNote> items)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
+        File.WriteAllText(_path, JsonSerializer.Serialize(items, new JsonSerializerOptions { WriteIndented = true }));
+    }
+}
+
+public sealed record EmployeeTask(Guid Id, DateOnly Date, string Description, DateTime CreatedAt,
+    string? SourceBotId = null, string? SourceChatId = null, long? SourceUpdateId = null);
 
 public sealed class EmployeeTaskStore
 {
-    private readonly string _path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PatarikAIOS", "employee-tasks.json");
+    private readonly string _path;
+    public EmployeeTaskStore(string? path = null) => _path = path ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PatarikAIOS", "employee-tasks.json");
+
+    public (EmployeeTask Task, bool Added) AddFromTelegram(DateOnly date, string description,
+        string botId, string chatId, long updateId)
+    {
+        var tasks = Load();
+        var existing = tasks.FirstOrDefault(task => task.SourceBotId == botId &&
+            task.SourceChatId == chatId && task.SourceUpdateId == updateId);
+        if (existing is not null) return (existing, false);
+
+        // A repaired legacy replay has a verified bot/chat but no update ID.
+        // Bind the queued original command without adding or announcing it again.
+        // Untagged legacy tasks and separate new messages are not merged by text.
+        var recoveredIndex = tasks.FindIndex(task => task.SourceBotId == botId &&
+            task.SourceChatId == chatId && task.SourceUpdateId is null &&
+            task.Date == date && task.Description == description);
+        if (recoveredIndex >= 0)
+        {
+            var recovered = tasks[recoveredIndex] with { SourceUpdateId = updateId };
+            tasks[recoveredIndex] = recovered;
+            Save(tasks);
+            return (recovered, false);
+        }
+
+        var task = new EmployeeTask(Guid.NewGuid(), date, description, DateTime.Now, botId, chatId, updateId);
+        tasks.Add(task);
+        Save(tasks);
+        return (task, true);
+    }
     public List<EmployeeTask> Load()
     {
         try { return File.Exists(_path) ? JsonSerializer.Deserialize<List<EmployeeTask>>(File.ReadAllText(_path)) ?? [] : []; }
@@ -318,7 +466,8 @@ public static class TelegramBotClient
         using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
         using var response = await client.GetAsync(Api(settings, "getUpdates" + offset), cancellationToken);
         var json = await response.Content.ReadAsStringAsync(cancellationToken);
-        if (!response.IsSuccessStatusCode) return [];
+        if (!response.IsSuccessStatusCode)
+            throw new InvalidOperationException($"Telegram getUpdates failed ({(int)response.StatusCode}).");
 
         using var document = JsonDocument.Parse(json);
         if (!document.RootElement.TryGetProperty("result", out var result) || result.ValueKind != JsonValueKind.Array) return [];
@@ -352,7 +501,8 @@ public static class TelegramBotClient
         using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
         var apiSettings = new TelegramBotSettings(settings.BotToken);
         using var response = await client.GetAsync(Api(apiSettings, "getUpdates" + offset), cancellationToken);
-        if (!response.IsSuccessStatusCode) return [];
+        if (!response.IsSuccessStatusCode)
+            throw new InvalidOperationException($"Employee Telegram getUpdates failed ({(int)response.StatusCode}).");
         var json = await response.Content.ReadAsStringAsync(cancellationToken);
         using var document = JsonDocument.Parse(json);
         if (!document.RootElement.TryGetProperty("result", out var result) || result.ValueKind != JsonValueKind.Array) return [];
@@ -397,7 +547,11 @@ public static class TelegramBotClient
         using var body = new FormUrlEncodedContent(fields);
         using var response = await client.PostAsync(Api(settings, "sendMessage"), body, cancellationToken);
         if (!response.IsSuccessStatusCode)
-            throw new InvalidOperationException("Telegram հաղորդագրությունը չուղարկվեց։ Ստուգեք, որ բոտին /start եք ուղարկել։");
+        {
+            var details = await response.Content.ReadAsStringAsync(cancellationToken);
+            if (details.Length > 500) details = details[..500];
+            throw new InvalidOperationException($"Telegram հաղորդագրությունը չուղարկվեց ({(int)response.StatusCode}): {details}");
+        }
     }
 
     public static async Task AnswerCallbackAsync(TelegramBotSettings settings, string callbackId, CancellationToken cancellationToken = default)

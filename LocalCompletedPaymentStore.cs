@@ -4,7 +4,7 @@ using System.Text.Json;
 namespace PatarikAIOS;
 
 /// <summary>Actual payments entered by the owner. These are intentionally separate from planned payments.</summary>
-public sealed record CompletedPayment(string Recipient, decimal Amount, DateOnly PaidDate, string Note, string? SourceDocument = null);
+public sealed record CompletedPayment(string Recipient, decimal Amount, DateOnly PaidDate, string Note, string? SourceDocument = null, string? CashSource = null);
 
 public sealed class LocalCompletedPaymentStore
 {

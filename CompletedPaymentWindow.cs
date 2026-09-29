@@ -9,10 +9,11 @@ public sealed class CompletedPaymentWindow : Window
     private readonly DatePicker _date;
     private readonly TextBox _note = new() { MinWidth = 280, MinHeight = 60, TextWrapping = TextWrapping.Wrap, AcceptsReturn = true };
     public CompletedPayment? Result { get; private set; }
+    private readonly ComboBox _source=PaymentSourcePicker.Create("0001");
 
     public CompletedPaymentWindow(IEnumerable<string> recipients, DateOnly selectedDate)
     {
-        Title = "Գրանցել կատարված վճարում"; Width = 490; Height = 410; WindowStartupLocation = WindowStartupLocation.CenterOwner;
+        Title = "Գրանցել կատարված վճարում"; Width = 550; Height = 540; WindowStartupLocation = WindowStartupLocation.CenterOwner;
         _date = new DatePicker { SelectedDate = selectedDate.ToDateTime(TimeOnly.MinValue), MinWidth = 280 };
         foreach (var recipient in recipients.Order()) _recipient.Items.Add(recipient);
 
@@ -20,6 +21,7 @@ public sealed class CompletedPaymentWindow : Window
         panel.Children.Add(Label("Մատակարար կամ այլ ստացող")); panel.Children.Add(_recipient);
         panel.Children.Add(Label("Փաստացի վճարված գումար (֏)")); panel.Children.Add(_amount);
         panel.Children.Add(Label("Վճարման օր")); panel.Children.Add(_date);
+        panel.Children.Add(Label("Վճարման աղբյուր (մնացորդից հանվում է մեկ անգամ)")); panel.Children.Add(_source);
         panel.Children.Add(Label("Նշում")); panel.Children.Add(_note);
         var actions = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 18, 0, 0) };
         var cancel = new Button { Content = "Չեղարկել", IsCancel = true }; cancel.Click += (_, _) => Close();
@@ -35,7 +37,7 @@ public sealed class CompletedPaymentWindow : Window
         {
             MessageBox.Show("Լրացրեք ստացողը, գումարը և վճարման օրը։", "Չլրացված տվյալներ", MessageBoxButton.OK, MessageBoxImage.Warning); return;
         }
-        Result = new CompletedPayment(_recipient.Text.Trim(), amount, DateOnly.FromDateTime(_date.SelectedDate.Value), _note.Text.Trim());
+        Result = new CompletedPayment(_recipient.Text.Trim(), amount, DateOnly.FromDateTime(_date.SelectedDate.Value), _note.Text.Trim(), "LOCAL-PAY-"+Guid.NewGuid().ToString("N"), PaymentSourcePicker.Value(_source));
         DialogResult = true;
     }
 

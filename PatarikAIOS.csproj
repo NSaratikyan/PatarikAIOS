@@ -7,6 +7,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
   <ItemGroup>
+    <EmbeddedResource Include="approved-supplier-names.json" />
     <!-- The Automation Host is a separate executable and must not be compiled
          into the WPF desktop application. -->
     <Compile Remove="Automation\**\*.cs" />

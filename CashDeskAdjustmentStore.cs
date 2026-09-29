@@ -15,7 +15,6 @@ public sealed class CashDeskAdjustmentStore
 
     public void Save(List<CashDeskAdjustment> items)
     {
-        Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
-        File.WriteAllText(_path, JsonSerializer.Serialize(items, new JsonSerializerOptions { WriteIndented = true }));
+        AtomicJsonFile.Save(_path, items);
     }
 }

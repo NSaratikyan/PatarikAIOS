@@ -3,12 +3,12 @@ using System.Windows.Media;
 
 namespace PatarikAIOS;
 
-public static class Views
+public static partial class Views
 {
     private static TextBlock Text(string value, double size = 14, FontWeight? weight = null, Brush? color = null) => new()
     { Text = value, FontSize = size, FontWeight = weight ?? FontWeights.Normal, Foreground = color ?? BrushFor("#1E293B"), TextWrapping = TextWrapping.Wrap };
 
-    private static Border Card(UIElement child) => new() { Background = Brushes.White, CornerRadius = new CornerRadius(10), Padding = new Thickness(18), Margin = new Thickness(0, 0, 14, 14), Child = child, BorderBrush = new SolidColorBrush(Color.FromRgb(226, 232, 240)), BorderThickness = new Thickness(1) };
+    private static Border Card(UIElement child) => new() { Background = Brushes.White, CornerRadius = new CornerRadius(10), Padding = new Thickness(20), Margin = new Thickness(0, 0, 12, 16), Child = child, BorderBrush = BrushFor("#DCE5F1"), BorderThickness = new Thickness(1) };
     private static string A(decimal amount) => $"{amount:N0} ֏";
 
     public static UIElement Dashboard(
@@ -23,25 +23,34 @@ public static class Views
         Action openFunds,
         Action openPayments,
         Action openRisks,
-        Action openApprovals)
+        Action openApprovals,
+        IReadOnlyList<(DateOnly Date, decimal? Amount)>? salesTrend = null)
     {
         var root = new StackPanel();
-        root.Children.Add(Text("CEO Dashboard — օրվա վերահսկման կենտրոն", 19, FontWeights.SemiBold));
-        var row = new WrapPanel { Margin = new Thickness(0, 16, 0, 0) };
-        row.Children.Add(Metric("Հասանելի միջոցներ", A(funds.Total), $"Կանխիկ՝ {A(funds.Cash)} · Բանկ՝ {A(funds.Bank)}", openFunds));
+        if (!string.IsNullOrWhiteSpace(s.Sales.DataWarning)) root.Children.Add(WarningBanner(s.Sales.DataWarning));
         // Use the same rule as the Payments page: supplier rows for the selected
         // day + API/manual plans + recurring non-supplier expenses.
         var plannedPayments = supplierRows.Sum(x => x.PaymentAmount + x.OldDebtPayment) +
             s.Payments.Where(p => p.DueDate == s.Date).Sum(p => p.Amount) +
             requiredPayments.Where(p => RequiredPaymentRules.AppliesOn(p, s.Date)).Sum(p => p.Amount);
-        row.Children.Add(Metric("Այսօրվա վճարումներ", A(plannedPayments), "Սեղմեք՝ վճարումների ցանկը տեսնելու համար", openPayments));
-        row.Children.Add(Metric("Այսօրվա վաճառք", A(s.Sales.SalesAmount), ChangeHint(s.Sales.SalesChange, "նախորդ օրվա համեմատ")));
-        row.Children.Add(Metric("Շահույթ", A(s.Sales.Profit), ChangeHint(s.Sales.ProfitChange, "նախորդ օրվա համեմատ")));
-        row.Children.Add(Metric("Կրիտիկական ռիսկեր", s.Recommendations.Count(x => x.Severity == Severity.Critical).ToString(), "Սեղմեք՝ ռիսկերը տեսնելու համար", openRisks));
-        row.Children.Add(Metric("Կտրոններ", s.Sales.ReceiptCount.ToString("N0"), ChangeHint(s.Sales.ReceiptChange, "նախորդ օրվա համեմատ")));
-        row.Children.Add(Metric("Սպասվող հաստատումներ", pendingApprovals.ToString(), pendingApprovals == 0 ? "Նոր հաստատում չկա" : "Սեղմեք՝ փոփոխությունները տեսնելու համար", openApprovals));
-        root.Children.Add(row);
-        root.Children.Add(PaymentSummaryBlock(s, completedPayments, requiredPayments, supplierRows, employeeSupplierActions));
+        root.Children.Add(TileRow(
+            ShowcaseMetric("Վաճառք", s.Sales.SalesDisplay, s.Sales.SalesAvailable && s.Sales.ComparisonAvailable ? ChangeHint(s.Sales.SalesChange, "նախորդ օրվա համեմատ") : "Ընտրված օրվա վաճառք", "▥", "#0962FF"),
+            ShowcaseMetric("Ինքնարժեք", s.Sales.CostDisplay, "Վաճառված ապրանքների արժեքը", "◇", "#12A875"),
+            ShowcaseMetric("Շահույթ", s.Sales.ProfitDisplay, "Վաճառք − ինքնարժեք", "◷", "#E99A16"),
+            ShowcaseMetric("Կտրոններ", s.Sales.ReceiptCount.ToString("N0"), "Միջին՝ " + A(s.Sales.AverageReceipt), "▤", "#8B5CF6")));
+        var chart = new StackPanel(); chart.Children.Add(Text("Վաճառքի գրաֆիկ (7 օր)", 18, FontWeights.SemiBold));
+        chart.Children.Add(new SalesTrendVisual(salesTrend ?? [(s.Date, s.Sales.SalesAvailable ? s.Sales.SalesAmount : null)]) { Height = 245, Margin = new Thickness(0,14,0,0) });
+        chart.Children.Add(Text("Բաց թողնված կետերը տվյալների բացակայություն են, ոչ թե զրո վաճառք։", 11, null, BrushFor("#72839C")));
+        var fundsPanel = new StackPanel(); fundsPanel.Children.Add(Text("Հասանելի միջոցների կառուցվածք", 18, FontWeights.SemiBold));
+        fundsPanel.Children.Add(new FundsRingVisual(funds) { Height = 220, Margin = new Thickness(0,8,0,8) });
+        var fundsButton = new Button { Content = "Մնացորդների մանրամասները", HorizontalAlignment = HorizontalAlignment.Left }; fundsButton.Click += (_, _) => openFunds(); fundsPanel.Children.Add(fundsButton);
+        root.Children.Add(Split(Card(chart), Card(fundsPanel), 1.45));
+        var attention = new StackPanel(); attention.Children.Add(Text("Ուշադրության համար", 18, FontWeights.SemiBold));
+        attention.Children.Add(TileRow(
+            ShowcaseMetric("Ռիսկեր", s.Recommendations.Count(x => x.Severity == Severity.Critical).ToString(), "Տեսնել խնդիրները", "!", "#E5484D", openRisks),
+            ShowcaseMetric("Հաստատումներ", pendingApprovals.ToString(), "Բացել ցանկը", "✓", "#0962FF", openApprovals)));
+        var paymentsButton = new Button { Content = "Վճարումների պլան՝ " + A(plannedPayments), HorizontalAlignment = HorizontalAlignment.Left }; paymentsButton.Click += (_, _) => openPayments(); attention.Children.Add(paymentsButton);
+        root.Children.Add(Split(PaymentSummaryBlock(s, completedPayments, requiredPayments, supplierRows, employeeSupplierActions), Card(attention), 1.2));
         root.Children.Add(EarlyWarningBlock(s, funds));
         if (cashSummary is not null) root.Children.Add(CashDocumentSummaryBlock(cashSummary));
         root.Children.Add(SalesBlock(s.Sales));
@@ -50,7 +59,7 @@ public static class Views
         return new ScrollViewer { Content = root, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
     }
 
-    public static UIElement Salaries(DateOnly selectedDate, IReadOnlyList<SalaryAccrual> accruals, IReadOnlyList<SalaryPayment> payments, IReadOnlyList<PendingSalaryEmployee> pendingEmployees, Action addAccrual, Action addPayment, Action<string> openEmployee, Action<Guid> approveEmployee, Action<Guid> rejectEmployee)
+    public static UIElement Salaries(DateOnly selectedDate, IReadOnlyList<SalaryAccrual> accruals, IReadOnlyList<SalaryPayment> payments, IReadOnlyList<PendingSalaryEmployee> pendingEmployees, Action addAccrual, Action addPayment, Action<string> openEmployee, Action<Guid> approveEmployee, Action<Guid> rejectEmployee, Action<string>? removeEmployee = null)
     {
         var weekStart = SalaryRules.WeekStart(selectedDate);
         var employees = accruals.Select(x => x.Employee).Concat(payments.Select(x => x.Employee)).Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(x => x).ToList();
@@ -81,21 +90,27 @@ public static class Views
 
         var weeklyAccrued = SalaryRules.AccruedForWeek(accruals, weekStart);
         var weeklyPaid = SalaryRules.PaidForWeek(payments, weekStart);
-        root.Children.Add(Section("Շաբաթվա ընդհանուր պատկերը", new[]
-        {
-            $"Գեներացված աշխատավարձ՝ {A(weeklyAccrued)}",
-            $"Վճարված աշխատավարձ՝ {A(weeklyPaid)}",
-            $"Վճարման ենթակա մնացորդ՝ {A(weeklyAccrued - weeklyPaid)}"
-        }));
+        // Weekly figures explain this week's work; total figures keep an
+        // earlier unpaid balance visible until it is actually paid.
+        var totalAccrued = accruals.Sum(x => x.Amount);
+        var totalPaid = payments.Sum(x => x.Amount);
+        var totalBalance = totalAccrued - totalPaid;
+        root.Children.Add(TileRow(
+            ShowcaseMetric("Շաբաթվա աշխատավարձ", A(weeklyAccrued), "Գրանցված գումար", "♙", "#0962FF"),
+            ShowcaseMetric("Շաբաթվա վճարված", A(weeklyPaid), "Փաստացի վճարումներ", "✓", "#12A875"),
+            ShowcaseMetric("Շաբաթվա մնացորդ", A(weeklyAccrued-weeklyPaid), "Այս շաբաթվա հաշվարկ", "◷", "#E99A16"),
+            ShowcaseMetric("Ընդհանուր պարտք", A(totalBalance), "Ներառում է նախկին շաբաթները", "֏", "#8B5CF6")));
 
-        var grid = NewGrid("Աշխատող", "Շաբաթվա գեներացված", "Վճարված", "Մնացորդ", "Վերջին գրառում", "");
+        var grid = NewGrid("Աշխատող", "Շաբաթվա գեներացված", "Շաբաթվա վճարված", "Շաբաթվա մնացորդ", "Ընդհանուր մնացորդ", "Վերջին գրառում", "");
         foreach (var employee in employees)
         {
             var personAccruals = accruals.Where(x => string.Equals(x.Employee, employee, StringComparison.OrdinalIgnoreCase)).OrderByDescending(x => x.Date).ToList();
             var accrued = SalaryRules.AccruedForWeek(accruals, weekStart, employee);
             var paid = SalaryRules.PaidForWeek(payments, weekStart, employee);
+            var totalEmployeeAccrued = accruals.Where(x => string.Equals(x.Employee, employee, StringComparison.OrdinalIgnoreCase)).Sum(x => x.Amount);
+            var totalEmployeePaid = payments.Where(x => string.Equals(x.Employee, employee, StringComparison.OrdinalIgnoreCase)).Sum(x => x.Amount);
             var latest = personAccruals.FirstOrDefault();
-            AddSalaryEmployeeRow(grid, employee, A(accrued), A(paid), A(accrued - paid), latest is null ? "—" : $"{latest.Date:dd.MM} · {latest.Note}", openEmployee);
+            AddSalaryEmployeeRow(grid, employee, A(accrued), A(paid), A(accrued - paid), A(totalEmployeeAccrued - totalEmployeePaid), latest is null ? "—" : $"{latest.Date:dd.MM} · {latest.Note}", openEmployee, removeEmployee);
         }
         root.Children.Add(Card(new StackPanel { Children = { Text("Աշխատողներ", 16, FontWeights.SemiBold), grid } }));
         root.Children.Add(Section("Ինչպես է աշխատում", new[]
@@ -107,12 +122,14 @@ public static class Views
         return new ScrollViewer { Content = root, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
     }
 
-    private static void AddSalaryEmployeeRow(Grid grid, string employee, string accrued, string paid, string balance, string latest, Action<string> openEmployee)
+    private static void AddSalaryEmployeeRow(Grid grid, string employee, string accrued, string paid, string balance, string totalBalance, string latest, Action<string> openEmployee, Action<string>? removeEmployee = null)
     {
         var row = grid.RowDefinitions.Count; grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        var open = new Button { Content = "Բացել", Padding = new Thickness(8, 3, 8, 3) };
+        var open = new Button { Content = "Խմբագրել", Padding = new Thickness(8, 3, 8, 3) };
         open.Click += (_, _) => openEmployee(employee);
-        var cells = new UIElement[] { Text(employee), Text(accrued), Text(paid), Text(balance), Text(latest), open };
+        var actions = new WrapPanel(); actions.Children.Add(open);
+        if(removeEmployee is not null) { var remove=new Button { Content="Հեռացնել", Foreground=Brushes.Firebrick, Padding=new Thickness(8,3,8,3) }; remove.Click+=(_,_)=>removeEmployee(employee); actions.Children.Add(remove); }
+        var cells = new UIElement[] { Text(employee), Text(accrued), Text(paid), Text(balance), Text(totalBalance), Text(latest), actions };
         for (var i = 0; i < cells.Length; i++)
         {
             if (cells[i] is FrameworkElement element) element.Margin = new Thickness(0, 8, 5, 8);
@@ -120,14 +137,79 @@ public static class Views
         }
     }
 
-    public static UIElement Finance(DashboardSnapshot s)
+    public static UIElement CashMovements(DateOnly selectedDate, IReadOnlyList<CashDayLedger> days, IReadOnlyList<CashLedgerMovement> details, string? syncStatus = null, Action<DateOnly>? editDay = null)
+    {
+        var root = new StackPanel();
+        root.Children.Add(Text("Կանխիկի շարժ", 19, FontWeights.SemiBold));
+        root.Children.Add(Text($"Ամիս՝ {selectedDate:MM.yyyy}. Վերևի աղյուսակը ցույց է տալիս օրական ամփոփումը, ներքևինը՝ ընտրված օրվա փաստաթղթերը։", 13, null, BrushFor("#64748B")));
+        if (!string.IsNullOrWhiteSpace(syncStatus))
+            root.Children.Add(Text(syncStatus, 13, FontWeights.SemiBold, BrushFor("#B45309")));
+        var closing = days.LastOrDefault(x => x.Date <= selectedDate);
+        root.Children.Add(TileRow(
+            ShowcaseMetric("0001 · Դրամարկղ", closing is null ? "Տվյալ չկա" : A(closing.CashDeskClosing), "Ընտրված օրվա մնացորդ", "֏", "#0962FF"),
+            ShowcaseMetric("0002 · Պահոց", closing is null ? "Տվյալ չկա" : A(closing.VaultClosing), "Ընտրված օրվա մնացորդ", "▣", "#12A875"),
+            ShowcaseMetric("Ընդհանուր կանխիկ", closing is null ? "Տվյալ չկա" : A(closing.TotalCash), "Ըստ գործող դրամարկղային հաշվարկի", "◷", "#8B5CF6")));
+        root.Children.Add(Text("0001 մնացորդ = նախորդ մնացորդ + ամբողջ վաճառք − անկանխիկ + այլ մուտք − ելք։ Ձեռքով թիվը փոխարինում է ավտոմատին։",12,null,BrushFor("#64748B")));
+        root.Children.Add(Text("Օրվա ամփոփ թվի ուղղումը չի փոխում առանձին մատակարարի պարտքը կամ սկզբնական փաստաթուղթը։ Փոխանցման համար օգտագործեք «Շարժ գրանցել»։",12,null,BrushFor("#64748B")));
+        var daily = NewGrid("Օր", "Վաճառք / մուտք", "Անկանխիկ", "Այլ մուտք 0001", "0001 ելք", "0001 մն.", "0002 մուտք", "0002 ելք", "0002 մն.", "Ընդ. կանխիկ", "");
+        foreach (var day in days)
+        {
+            var edit = new Button { Content = day.IsManual ? "✎ Ձեռքով" : "Խմբագրել", IsEnabled = editDay is not null, Padding = new Thickness(6,4,6,4) };
+            edit.Click += (_,_) => editDay?.Invoke(day.Date);
+            AddApprovalRow(daily,Text(day.Date.ToString("dd.MM")),Text(A(day.GrossSales)),Text(A(day.NonCash)),Text(A(day.OtherCashIn)),Text(A(day.CashDeskOut)),Text(A(day.CashDeskClosing)),Text(A(day.VaultIn)),Text(A(day.VaultOut)),Text(A(day.VaultClosing)),Text(A(day.TotalCash)),edit);
+        }
+        root.Children.Add(Card(new StackPanel { Children = { Text("Օրական ամփոփում", 16, FontWeights.SemiBold), daily } }));
+
+        var detail = NewGrid("Փաստաթուղթ", "Դրամարկղ", "Տեսակ", "Գործընկեր / պատճառ", "Գումար");
+        foreach (var item in details)
+        {
+            var cashDesk = string.IsNullOrWhiteSpace(item.SourceCashDesk) ? item.TargetCashDesk ?? "—" : item.SourceCashDesk;
+            var direction = string.IsNullOrWhiteSpace(item.SourceCashDesk) ? "Մուտք" : item.IsInternalTransfer ? $"Փոխանցում → {item.TargetCashDesk}" : "Ելք";
+            AddRow(detail, item.DocumentNumber, cashDesk, direction, string.IsNullOrWhiteSpace(item.Partner) ? item.ContractOrReason : item.Partner, A(item.Amount));
+        }
+        root.Children.Add(Card(new StackPanel { Children = { Text($"Փաստաթղթեր՝ {selectedDate:dd.MM.yyyy}", 16, FontWeights.SemiBold), detail } }));
+        if (details.Count == 0) root.Children.Add(Text("Այս օրվա համար ներմուծված դրամարկղային փաստաթուղթ չկա։", 13, null, BrushFor("#64748B")));
+        return new ScrollViewer { Content = root, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Auto };
+    }
+
+    public static UIElement Finance(DashboardSnapshot s, WeeklyFinancialPlan weeklyPlan, CashFlowPolicy policy, Action openPolicy)
     {
         var root = new StackPanel(); root.Children.Add(Text("Ֆինանսական կենտրոն", 19, FontWeights.SemiBold));
-        root.Children.Add(Section("💰 Այս պահի դիրք", new[] { $"Դրամարկղ՝ {A(s.Cash.Cash)}", $"Բանկ՝ {A(s.Cash.Bank)}", $"Ընդհանուր հասանելի՝ {A(s.Cash.Available)}" }));
+        root.Children.Add(Text("Շաբաթվա պլանը վաճառքի կանխատեսումը, կոշտ ծախսերը, աշխատավարձը և մատակարարային վճարները միացնում է մեկ բյուջեի մեջ։", 13, null, BrushFor("#64748B")));
+        var policyButton = new Button { Content = "⚙ Ֆինանսական կանոններ", HorizontalAlignment = HorizontalAlignment.Left, Margin = new Thickness(0, 12, 0, 10) };
+        policyButton.Click += (_, _) => openPolicy();
+        root.Children.Add(policyButton);
+        root.Children.Add(TileRow(
+            ShowcaseMetric("Շաբաթվա բազա", A(weeklyPlan.BaselineWeekSales), "Վաճառքի հաշվարկային հիմք", "▥", "#0962FF"),
+            ShowcaseMetric("Պարտադիր վճարներ", A(weeklyPlan.FixedPaymentsDue), "Շաբաթվա պարտավորություններ", "▤", "#E99A16"),
+            ShowcaseMetric("Աշխատավարձ", A(weeklyPlan.SalaryPaymentsDue), "Վճարման ենթակա", "♙", "#8B5CF6"),
+            ShowcaseMetric("Ազատ գումար", SignedPlain(weeklyPlan.FreeMoney), weeklyPlan.IsWithinPlan ? "Հասանելի բյուջե" : "Բյուջեի գերազանցում", "֏", weeklyPlan.IsWithinPlan ? "#12A875" : "#E5484D")));
+        root.Children.Add(Section("💰 Այս պահի դիրք", new[] { $"Դրամարկղ՝ {A(s.Cash.Cash)}", $"Բանկ՝ {A(s.Cash.Bank)}", $"Ընդհանուր հասանելի՝ {A(s.Cash.Available)}", $"Պաշտպանական պահուստ՝ {A(policy.MinimumReserve)}" }));
+
+        var budget = NewGrid("Ցուցանիշ", "Գումար", "Բացատրություն");
+        AddRow(budget, "Շաբաթվա վաճառքի բազա", A(weeklyPlan.BaselineWeekSales), "Նախորդ 7 օրվա միջին կամ ձեր նշած հիմք");
+        AddRow(budget, "Վաճառքի շեղում", SignedPlain(weeklyPlan.SalesVariance), weeklyPlan.SalesVariance >= 0m ? "Փաստացի/ընթացիկ վաճառքը պլանից բարձր է" : "Փաստացի/ընթացիկ վաճառքը պլանից ցածր է");
+        AddRow(budget, "Կոշտ վճարումներ", A(weeklyPlan.FixedPaymentsDue), "Պարտադիր վճարներ, որոնք ընկնում են այս 7 օրվա մեջ");
+        AddRow(budget, "Աշխատավարձ", A(weeklyPlan.SalaryPaymentsDue), "Շաբաթվա վճարման ենթակա աշխատավարձ");
+        AddRow(budget, "Մատակարարների վճարներ", A(weeklyPlan.SupplierPaymentsDue), "Նոր պատվերի և հին պարտքի վճարումներ");
+        AddRow(budget, "Պաշտպանական պահուստ", A(weeklyPlan.MinimumReserve), "Չի առաջարկվում ծախսել առանց ձեր որոշման");
+        AddRow(budget, "Շաբաթվա ազատ գումար", SignedPlain(weeklyPlan.FreeMoney), weeklyPlan.IsWithinPlan ? "Կարելի է օգտագործել լրացուցիչ ճկուն վճարների կամ պահուստի համար" : "Պլանը գերազանցում է շաբաթվա վաճառքային բյուջեն");
+        root.Children.Add(Card(new StackPanel { Children = { Text("Շաբաթվա վճարային բյուջե", 16, FontWeights.SemiBold), budget } }));
+
+        var dailyBudget = NewGrid("Օր", "Վաճառք", "Կոշտ ծախսի պահուստ", "Աշխատավարձի կուտակում", "Պլան. վճարում", "Օրվա սահման", "Շեղում", "Հաջորդ օրերի նոր սահման");
+        foreach (var day in weeklyPlan.Days)
+            AddRow(dailyBudget, day.Date.ToString("dd.MM"), A(day.SalesPlan), A(day.FixedCostReserve), A(day.SalaryAccrual), A(day.PlannedPayments), A(day.DailyPaymentLimit), SignedPlain(day.DifferenceFromLimit), A(day.NextDaysDailyLimit));
+        root.Children.Add(Card(new StackPanel { Children =
+        {
+            Text("Օրական սահմանաչափի վերահաշվարկ", 16, FontWeights.SemiBold),
+            Text("Եթե օրվա վճարումը սահմանաչափից բարձր է, տարբերությունը հանվում է հաջորդ օրերի թույլատրելի գումարից։ Եթե պակաս է՝ հաջորդ օրերի սահմանը մեծանում է։", 12, null, BrushFor("#64748B")),
+            dailyBudget
+        }}));
+
         var grid = NewGrid("Ամսաթիվ", "Սպասվող մուտք", "Սպասվող ելք", "Օրվա վերջի կանխատեսում");
         foreach (var f in s.Forecast) AddRow(grid, f.Date.ToString("dd.MM"), A(f.ExpectedIncome), A(f.ExpectedOutflow), A(f.ClosingBalance));
         root.Children.Add(Card(new StackPanel { Children = { Text("📈 7-օրյա cash-flow կանխատեսում", 16, FontWeights.SemiBold), grid } }));
-        return new ScrollViewer { Content = root };
+        return new ScrollViewer { Content = root, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Auto };
     }
 
     public static UIElement PurchasePlan(DateOnly planningDate, DateOnly deliveryDate, IReadOnlyList<SupplierWeekPlanRow> scheduledSuppliers, IReadOnlyList<PurchaseProposal> proposals)
@@ -213,15 +295,21 @@ public static class Views
         return new ScrollViewer { Content = root, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Auto };
     }
 
-    public static UIElement Suppliers(IReadOnlyList<SupplierWeekPlanRow> rows, IReadOnlyList<Supplier> supplierDebts, IReadOnlyList<PartnerDebt> importedDebts, IReadOnlyList<EmployeeSupplierAction> employeeActions, IReadOnlyList<SupplierStatusChange> statusChanges, Action<SupplierWeekPlanRow, decimal, decimal, decimal, decimal> saveRow, Action<string> showSupplierStatus, Action<SupplierWeekPlanRow, EmployeeSupplierAction?> editStatus)
+    public static UIElement Suppliers(IReadOnlyList<SupplierWeekPlanRow> rows, IReadOnlyList<Supplier> supplierDebts, IReadOnlyList<PartnerDebt> importedDebts, IReadOnlyList<EmployeeSupplierAction> employeeActions, IReadOnlyList<SupplierStatusChange> statusChanges, IReadOnlyList<SupplierNote> supplierNotes, WeeklyFinancialPlan weeklyPlan, Action<SupplierWeekPlanRow, decimal, decimal, decimal, decimal> saveRow, Action<string> showSupplierStatus, Action<string> showSupplierDebtHistory, Action<SupplierWeekPlanRow, EmployeeSupplierAction?> editStatus, Action<SupplierWeekPlanRow> addNote, Action<SupplierWeekPlanRow> showAnalysis, Func<IReadOnlyList<SupplierRowEdit>, Task> saveAll, IDictionary<string, string[]> drafts, string? saveStatus = null)
     {
         var root = new StackPanel();
-        root.Children.Add(Text("Մատակարարների շաբաթական գրաֆիկ", 19, FontWeights.SemiBold));
-        root.Children.Add(Text("01.07.2026–31.12.2026 · Ընտրված օրվա մատակարարման գրաֆիկը և գումարները։", 13, null, BrushFor("#64748B")));
+        var footer = new StackPanel();
+        var top = TileRow(ShowcaseMetric("Պատվերներ", A(rows.Sum(x => x.OrderAmount)), "Պահպանված պատվերների գումար", "▤", "#0962FF"), ShowcaseMetric("Վճարում", A(rows.Sum(x => x.PaymentAmount)), "Պատվերի դիմաց", "▣", "#12A875"), ShowcaseMetric("Հին պարտքի վճարում", A(rows.Sum(x => x.OldDebtPayment)), "Նախորդ պարտավորություններ", "◷", "#E99A16"));
+        root.Children.Add(Text("Օրվա պատվերների գրանցում", 16, FontWeights.SemiBold));
+        if (!string.IsNullOrWhiteSpace(saveStatus)) root.Children.Add(Text(saveStatus, 13, null, BrushFor("#166534")));
+        root.Children.Add(Text("Գումարները փոփոխելուց հետո պահպանեք առանձին տողը կամ օրվա բոլոր մուտքերը։", 13, null, BrushFor("#64748B")));
         foreach (var day in rows.GroupBy(x => x.Date).OrderBy(x => x.Key))
         {
+            var editors = new List<Func<SupplierRowEdit?>>();
             root.Children.Add(Text($"{ArmenianWeekdayLabel(day.Key.DayOfWeek)} · {day.Key:dd.MM.yyyy}", 16, FontWeights.SemiBold, BrushFor("#0F766E")));
-            var grid = NewGrid("Մատակարար", "Պատվեր", "Վճարում", "Հին թվի վճարում", "Ընթացիկ պարտք", "Պարտքի փոփոխություն", "Կարգավիճակ", "");
+            var grid = NewGrid("Մատակարար", "Պատվեր", "Վճարում", "Հին պարտքի վճարում", "Պարտք / փոփոխություն", "Կարգավիճակ", "Նշում", "Գործողություն");
+            var widths = new double[] { 190, 100, 100, 100, 132, 130, 160, 196 };
+            for (var i = 0; i < widths.Length; i++) { grid.ColumnDefinitions[i].Width = new GridLength(widths[i], GridUnitType.Star); grid.ColumnDefinitions[i].MinWidth = widths[i] * 0.85; }
             foreach (var row in day)
             {
                 var currentAction = employeeActions
@@ -232,13 +320,14 @@ public static class Views
                     .Where(x => x.Date == row.Date && SupplierNamesMatch(x.Supplier, row.Supplier))
                     .OrderByDescending(x => x.ChangedAt)
                     .FirstOrDefault();
-                if (manualChange is not null)
+                if (manualChange is not null && (currentAction is null || manualChange.ChangedAt >= currentAction.ReportedAt))
                 {
                     var explanation = $"Ձեռքով փոփոխվել է {manualChange.ChangedAt:dd.MM.yyyy HH:mm}-ին։ Նախորդ կարգավիճակ՝ {manualChange.PreviousStatus}.";
                     if (!string.IsNullOrWhiteSpace(manualChange.Note)) explanation += $" Նշում՝ {manualChange.Note}";
                     currentAction = new EmployeeSupplierAction(row.Date, row.Supplier, manualChange.NewStatus, explanation, "owner", manualChange.ChangedBy, manualChange.ChangedAt);
                 }
-                AddEditableSupplierWeekRow(grid, ApplyKnownDebt(row, supplierDebts, importedDebts), currentAction, saveRow, showSupplierStatus, editStatus);
+                var latestNote = supplierNotes.Where(note => note.Date == row.Date && SupplierNamesMatch(note.Supplier, row.Supplier)).OrderByDescending(note => note.CreatedAt).FirstOrDefault();
+                AddEditableSupplierWeekRow(grid, ApplyKnownDebt(row, supplierDebts, importedDebts), currentAction, latestNote, saveRow, showSupplierStatus, showSupplierDebtHistory, editStatus, addNote, showAnalysis, editors, drafts);
             }
             var orderCount = day.Count(x => x.OrderAmount > 0);
             var orderSum = day.Sum(x => x.OrderAmount);
@@ -250,9 +339,49 @@ public static class Views
             summary.Children.Add(Text("Օրվա ամփոփում", 14, FontWeights.SemiBold));
             summary.Children.Add(Text($"Պատվերների քանակ՝ {orderCount} · Պատվերների գումար՝ {A(orderSum)} · Վճարում՝ {A(paymentSum)} · Հին թվի վճարում՝ {A(oldDebtSum)}"));
             summary.Children.Add(Text($"Պարտքի փոփոխություն՝ {Signed(debtChange)} · {note}", 14, FontWeights.SemiBold, debtChange > 0 ? BrushFor("#B91C1C") : debtChange < 0 ? BrushFor("#0F766E") : BrushFor("#475569")));
-            root.Children.Add(Card(new StackPanel { Children = { grid, new Separator { Margin = new Thickness(0, 12, 0, 10) }, summary } }));
+            var saveAllButton = new Button { Content = "✓ Պահպանել օրվա բոլոր մուտքերը", HorizontalAlignment = HorizontalAlignment.Left, Padding = new Thickness(12, 7, 12, 7), Margin = new Thickness(0, 8, 0, 0) };
+            saveAllButton.Click += async (_, _) =>
+            {
+                var edits = editors.Select(read => read()).ToList();
+                if (edits.Any(edit => edit is null))
+                {
+                    MessageBox.Show("Կա սխալ գումար։ Ուղղեք նշված տողը․ ոչինչ չի պահպանվել։", "Սխալ տվյալ");
+                    return;
+                }
+                saveAllButton.IsEnabled = false;
+                try { await saveAll(edits.Cast<SupplierRowEdit>().ToList()); }
+                finally { saveAllButton.IsEnabled = true; }
+            };
+            saveAllButton.Background = PresentationTheme.Blue; saveAllButton.Foreground = Brushes.White;
+            var footerRow = new DockPanel { Margin = new Thickness(0,0,12,0) };
+            saveAllButton.HorizontalAlignment = HorizontalAlignment.Right; saveAllButton.VerticalAlignment = VerticalAlignment.Center;
+            DockPanel.SetDock(saveAllButton,Dock.Right); footerRow.Children.Add(saveAllButton); footerRow.Children.Add(summary);
+            root.Children.Add(Card(grid));
+            footer.Children.Add(footerRow);
         }
-        return new ScrollViewer { Content = root, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Auto };
+        var bottom = new StackPanel(); bottom.Children.Add(WeeklyPaymentStatus(weeklyPlan)); bottom.Children.Add(footer);
+        return AdaptiveOrders(top, root, bottom);
+    }
+
+    private static UIElement WeeklyPaymentStatus(WeeklyFinancialPlan plan)
+    {
+        var today = plan.Days.FirstOrDefault();
+        var remainingDays = Math.Max(0, plan.Days.Count - 1);
+        var statusColor = plan.IsWithinPlan ? BrushFor("#166534") : BrushFor("#B91C1C");
+        var impactText = today is null ? "—" : SignedPlain(today.DifferenceFromLimit);
+        var impactHint = today is null ? "" : today.DifferenceFromLimit > 0m
+            ? "օգտագործվել է հաջորդ օրերի սահմանաչափից"
+            : today.DifferenceFromLimit < 0m ? "մնացել է հաջորդ օրերի համար" : "օրվա սահմանաչափին համընկնում է";
+        var panel = new StackPanel();
+        panel.Children.Add(Text($"Շաբաթվա ազատ գումար՝ {SignedPlain(plan.FreeMoney)}", 19, FontWeights.Bold, plan.IsWithinPlan ? PresentationTheme.Blue : statusColor));
+        panel.Children.Add(Text($"Մնացած {remainingDays} օրվա նոր միջին սահման՝ {A(today?.NextDaysDailyLimit ?? 0m)} / օր", 12, FontWeights.SemiBold));
+        var detail = new StackPanel();
+        detail.Children.Add(Text($"Այս օրվա սահմանաչափից շեղում՝ {impactText} · {impactHint}", 13, null, BrushFor("#475569")));
+        detail.Children.Add(Text(plan.IsWithinPlan
+            ? "🟢 Պլանը հավասարակշռված է։ Հաջորդ օրերի սահմանաչափը հաշվարկվել է վերջին փոփոխությունների հիման վրա։"
+            : $"🔴 Պլանում պակաս կա՝ {A(Math.Abs(plan.FreeMoney))}։ Վերանայեք միայն ճկուն վճարումները կամ հաստատեք բացառություն։", 13, FontWeights.SemiBold, statusColor));
+        panel.Children.Add(new Expander { Header = plan.IsWithinPlan ? "Շաբաթվա փոփոխության մանրամասները" : "⚠ Սահմանաչափը գերազանցված է · մանրամասներ", Content = detail, Margin = new Thickness(0,6,0,0), Foreground = statusColor });
+        return Card(panel);
     }
 
     public static UIElement Payments(DashboardSnapshot s, IReadOnlyList<CompletedPayment> completedPayments, IReadOnlyList<RequiredPaymentTemplate> requiredPayments, IReadOnlyList<SupplierWeekPlanRow> supplierRows, IReadOnlyList<EmployeeSupplierAction> employeeSupplierActions, IReadOnlyList<SalaryPayment> salaryPayments, decimal plannedSalary, Action<RequiredPaymentTemplate> editPayment, Action<RequiredPaymentTemplate> deletePayment)
@@ -322,14 +451,50 @@ public static class Views
         var totalCost = rows.Sum(x => x.CostAmount);
         var metrics = new WrapPanel { Margin = new Thickness(0, 14, 0, 0) };
         metrics.Children.Add(Metric("Կապված վաճառք", A(totalSales), $"{rows.Count} մատակարար"));
-        metrics.Children.Add(Metric("Ինքնարժեք", A(totalCost), "Ըստ վաճառված ապրանքների"));
-        metrics.Children.Add(Metric("Շահույթ", A(totalSales - totalCost), "Մատակարարային կապով"));
+        metrics.Children.Add(Metric("Ինքնարժեք", rows.All(x => x.CostAvailable) ? A(totalCost) : "Տվյալ չկա", "Ըստ վաճառված ապրանքների"));
+        metrics.Children.Add(Metric("Շահույթ", rows.All(x => x.CostAvailable) ? A(totalSales - totalCost) : "Չի հաշվարկվել", "Վաճառք − ինքնարժեք"));
         root.Children.Add(metrics);
 
         var grid = NewGrid("Մատակարար", "Վաճառք", "Ինքնարժեք", "Շահույթ", "Քանակ", "Ապրանք", "Պահեստ");
         foreach (var row in rows)
-            AddRow(grid, row.Supplier, A(row.SalesAmount), A(row.CostAmount), A(row.Profit), row.Quantity.ToString("N2"), row.ProductCount.ToString(), row.StorageCount.ToString());
+            AddRow(grid, row.Supplier, A(row.SalesAmount), row.CostDisplay, row.ProfitDisplay, row.Quantity.ToString("N2"), row.ProductCount.ToString(), row.StorageCount.ToString());
         root.Children.Add(Card(new StackPanel { Children = { Text("Մանրամասն", 16, FontWeights.SemiBold), grid } }));
+        return new ScrollViewer { Content = root, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Auto };
+    }
+
+    public static UIElement SupplierAnalysisCard(SupplierAnalysisData data)
+    {
+        var root = new StackPanel();
+        root.Children.Add(Text(data.Supplier, 20, FontWeights.SemiBold, BrushFor("#0F766E")));
+        root.Children.Add(Text($"{data.StartDate:dd.MM.yyyy}–{data.EndDate:dd.MM.yyyy} · " + (data.FromHts ? "Տվյալները՝ ՀԾ-ից" : "Տվյալները՝ ծրագրի հաստատված պլանից"), 13, null, BrushFor("#64748B")));
+
+        var receipts = data.Activity.Sum(x => x.ReceiptAmount);
+        var payments = data.Activity.Sum(x => x.PaymentForOrder);
+        var oldPayments = data.Activity.Sum(x => x.OldDebtPayment);
+        var metrics = new WrapPanel { Margin = new Thickness(0, 14, 0, 8) };
+        metrics.Children.Add(Metric("Ստացում", A(receipts), "Գնումներ՝ ձեռքբերման գնով"));
+        metrics.Children.Add(Metric("Վճարում", A(payments), "Տվյալ ստացման դիմաց"));
+        metrics.Children.Add(Metric("Հին պարտքի վճարում", A(oldPayments), "Նախորդ պարտավորություն"));
+        metrics.Children.Add(Metric("Պարտքի փոփոխություն", Signed(receipts - payments - oldPayments), "Ընտրված ժամանակահատվածում"));
+        metrics.Children.Add(Metric("Ընթացիկ պարտք", A(data.CurrentDebt), "Ընտրված օրվա դրությամբ"));
+        root.Children.Add(metrics);
+
+        var history = NewGrid("Ամսաթիվ", "Ստացում", "Վճարում", "Հին պարտք", "Փաստաթուղթ", "Նկարագրություն");
+        foreach (var line in data.Activity)
+            AddRow(history, line.Date.ToString("dd.MM.yyyy"), A(line.ReceiptAmount), A(line.PaymentForOrder), A(line.OldDebtPayment), line.DocumentNumbers, line.Description);
+        if (data.Activity.Count == 0) AddRow(history, "—", "0 ֏", "0 ֏", "0 ֏", "", "Ընտրված ժամանակահատվածում շարժ չի գտնվել");
+        root.Children.Add(Card(new StackPanel { Children = { Text("Ստացումներ և վճարումներ", 16, FontWeights.SemiBold), history } }));
+
+        var sales = data.Sales;
+        if (!string.IsNullOrWhiteSpace(data.Warning)) root.Children.Add(Text(data.Warning, 13, null, BrushFor("#B45309")));
+        var salesMetrics = new WrapPanel { Margin = new Thickness(0, 4, 0, 8) };
+        salesMetrics.Children.Add(Metric("Վաճառք", sales is null ? "Տվյալ չկա" : A(sales.SalesAmount), "Վաճառքի գնով"));
+        salesMetrics.Children.Add(Metric("Ինքնարժեք", sales?.CostDisplay ?? "Տվյալ չկա", "Մատակարարի/ձեռքբերման գնով"));
+        salesMetrics.Children.Add(Metric("Շահույթ", sales?.ProfitDisplay ?? "Չի հաշվարկվել", "Վաճառք − ինքնարժեք"));
+        salesMetrics.Children.Add(Metric("Վաճառված քանակ", (sales?.Quantity ?? 0m).ToString("N2"), $"Ապրանք՝ {sales?.ProductCount ?? 0}"));
+        salesMetrics.Children.Add(Metric("Պահեստներ", (sales?.StorageCount ?? 0).ToString(), "Վաճառքի աղբյուրներ"));
+        root.Children.Add(Card(new StackPanel { Children = { Text("Վաճառքի վերլուծություն", 16, FontWeights.SemiBold), salesMetrics } }));
+
         return new ScrollViewer { Content = root, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Auto };
     }
 
@@ -355,6 +520,7 @@ public static class Views
     {
         var root = new StackPanel();
         root.Children.Add(Text("Ամփոփում", 19, FontWeights.SemiBold));
+        if (!string.IsNullOrWhiteSpace(summary.Sales.DataWarning)) root.Children.Add(WarningBanner(summary.Sales.DataWarning));
         root.Children.Add(Text($"Ժամանակահատված՝ {filterDescription}", 13, null, BrushFor("#64748B")));
 
         var filters = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 12, 0, 16) };
@@ -363,9 +529,11 @@ public static class Views
         var day = new Button { Content = "Ընտրված օր", Margin = new Thickness(0, 0, 8, 0) }; day.Click += (_, _) => showDay();
         filters.Children.Add(month); filters.Children.Add(week); filters.Children.Add(day); root.Children.Add(filters);
 
-        var salesGrid = NewGrid("Վաճառք", "Ինքնարժեք", "Շահույթ", "Կտրոններ", "Միջին չեկ");
-        AddRow(salesGrid, A(summary.Sales.SalesAmount), A(summary.Sales.CostAmount), A(summary.Sales.Profit), summary.Sales.ReceiptCount.ToString("N0"), A(summary.Sales.AverageReceipt));
-        root.Children.Add(Card(new StackPanel { Children = { Text("Վաճառք և շահութաբերություն", 16, FontWeights.SemiBold), salesGrid } }));
+        root.Children.Add(TileRow(
+            ShowcaseMetric("Վաճառք",summary.Sales.SalesDisplay,"Ընտրված ժամանակահատված","▥","#0962FF"),
+            ShowcaseMetric("Ինքնարժեք",summary.Sales.CostDisplay,"Վաճառված ապրանքների արժեք","◇","#12A875"),
+            ShowcaseMetric("Շահույթ",summary.Sales.ProfitDisplay,"Վաճառք − ինքնարժեք","◷","#E99A16"),
+            ShowcaseMetric("Կտրոններ",summary.Sales.ReceiptCount.ToString("N0"),"Միջին չեկ՝ "+A(summary.Sales.AverageReceipt),"▤","#8B5CF6")));
 
         var supplies = NewGrid("Պահեստ", "Մատակարարված ապրանք", "Տեսակ");
         foreach (var row in summary.Supplies.OrderByDescending(x => x.Amount))
@@ -398,11 +566,15 @@ public static class Views
     }
 
     /// <summary>Owner approval queue for deviations reported by employees.</summary>
-    public static UIElement Approvals(IReadOnlyList<PendingEmployeeOrderChange> changes, Action<Guid> approve, Action<Guid> reject, Action approveAll)
+    public static UIElement Approvals(IReadOnlyList<PendingEmployeeOrderChange> changes, Action<Guid> approve, Action<Guid> reject, Action approveAll, Action<Guid> resolveSupplier, IReadOnlyList<string>? knownSuppliers = null)
     {
         var root = new StackPanel();
         root.Children.Add(Text("Հաստատումների կենտրոն", 19, FontWeights.SemiBold));
         root.Children.Add(Text("Այստեղ են աշխատակիցների նշած այն փաստացի տվյալները, որոնք տարբերվում են պլանից։ Հաստատումից հետո մատակարարի պլանը և պարտքի հաշվարկը թարմացվում են։", 13, null, BrushFor("#64748B")));
+        root.Children.Add(TileRow(
+            ShowcaseMetric("Սպասվող", changes.Count.ToString(), "Ուղարկված տողեր", "▤", "#0962FF"),
+            ShowcaseMetric("Անունը ճշտելու", changes.Count(x => ApprovalWarnings.Unknown(x,knownSuppliers)).ToString(), "Պահանջում է վերանայում", "!", "#E5484D"),
+            ShowcaseMetric("Հավանական կրկնում", changes.Count(x => ApprovalWarnings.Duplicate(x,changes)).ToString(), "Ստուգեք մինչև հաստատելը", "▣", "#E99A16")));
 
         if (changes.Count == 0)
         {
@@ -417,20 +589,38 @@ public static class Views
         var grid = NewGrid("Ամսաթիվ", "Մատակարար", "Պլան", "Փաստացի", "Շեղում", "Աշխատակից", "");
         foreach (var item in changes.OrderBy(x => x.Date).ThenBy(x => x.Supplier))
         {
+            var unknown = ApprovalWarnings.Unknown(item, knownSuppliers);
+            var duplicate = ApprovalWarnings.Duplicate(item, changes);
             var planned = item.PlannedOrder + item.PlannedPayment + item.PlannedOldDebtPayment;
             var actual = item.ActualOrder + item.ActualPayment + item.ActualOldDebtPayment;
             var difference = actual - planned;
-            var actions = new StackPanel { Orientation = Orientation.Horizontal };
+            var actions = new WrapPanel();
             var yes = new Button { Content = "Հաստատել", Background = BrushFor("#166534"), Foreground = Brushes.White, Padding = new Thickness(8, 3, 8, 3) };
             yes.Click += (_, _) => approve(item.Id);
             var no = new Button { Content = "Մերժել", Margin = new Thickness(6, 0, 0, 0), Padding = new Thickness(8, 3, 8, 3) };
             no.Click += (_, _) => reject(item.Id);
             actions.Children.Add(yes); actions.Children.Add(no);
-            AddApprovalRow(grid,
-                item.Date.ToString("dd.MM.yyyy"), item.Supplier,
-                $"{A(item.PlannedOrder)} / {A(item.PlannedPayment)} / {A(item.PlannedOldDebtPayment)}",
-                $"{A(item.ActualOrder)} / {A(item.ActualPayment)} / {A(item.ActualOldDebtPayment)}",
-                SignedPlain(difference), item.ReportedByName, actions);
+            var edit = new Button { Content = "Խմբագրել", Margin = new Thickness(6, 0, 0, 0), Padding = new Thickness(8, 3, 8, 3), ToolTip = "Փոխել մատակարարի անունը և փաստացի գումարները" };
+            if (item.Corrections is { Count: > 0 })
+                edit.ToolTip = string.Join("\n", item.Corrections.Select(x =>
+                    $"{x.At:dd.MM.yyyy HH:mm} · {x.EditedBy}\n{x.PreviousSupplier} → {x.Supplier}\nՊատվեր՝ {x.PreviousOrder:N2} → {x.Order:N2}, վճարում՝ {x.PreviousPayment:N2} → {x.Payment:N2}, հին պարտքի վճարում՝ {x.PreviousOldDebtPayment:N2} → {x.OldDebtPayment:N2}"));
+            edit.Click += (_, _) => resolveSupplier(item.Id);
+            actions.Children.Add(edit);
+            if (item.RequiresSupplierReview)
+            {
+                yes.IsEnabled = false;
+                var resolve = new Button { Content = "⚠ Ճշտել անունը", Margin = new Thickness(6, 0, 0, 0) };
+                resolve.Click += (_, _) => resolveSupplier(item.Id);
+                actions.Children.Add(resolve);
+            }
+            var name = Text(item.Supplier + (unknown ? "\n⚠ Անունը պետք է ճշտել" : "") + (duplicate ? "\n⚠ Հավանական կրկնում" : ""),
+                14, unknown || duplicate ? FontWeights.SemiBold : FontWeights.Normal,
+                unknown ? Brushes.Firebrick : duplicate ? Brushes.DarkOrange : BrushFor("#0F172A"));
+            if (unknown) name.ToolTip = "Հավանական տարբերակներ՝ " + string.Join(", ", SupplierNameSuggestions.Find(item.Supplier, knownSuppliers ?? []));
+            AddApprovalRow(grid, Text(item.Date.ToString("dd.MM.yyyy")), name,
+                Text($"{A(item.PlannedOrder)} / {A(item.PlannedPayment)} / {A(item.PlannedOldDebtPayment)}"),
+                Text($"{A(item.ActualOrder)} / {A(item.ActualPayment)} / {A(item.ActualOldDebtPayment)}"),
+                Text(SignedPlain(difference)), Text(item.ReportedByName), actions);
         }
         root.Children.Add(Card(grid));
         root.Children.Add(Text("Ձևաչափը՝ պատվեր / նոր վճարում / հին պարտքի վճարում։", 12, null, BrushFor("#64748B")));
@@ -496,8 +686,10 @@ public static class Views
     private static UIElement SalesBlock(SalesSummary sales)
     {
         var grid = NewGrid("Վաճառք", "Ինքնարժեք", "Շահույթ", "Կտրոնների քանակ", "Միջին չեկ", "Փոփոխություններ");
-        var changes = $"Վաճառք՝ {SignedPlain(sales.SalesChange)}\nՇահույթ՝ {SignedPlain(sales.ProfitChange)}\nԿտրոններ՝ {sales.ReceiptChange:+#;-#;0}";
-        AddRow(grid, A(sales.SalesAmount), A(sales.CostAmount), A(sales.Profit), sales.ReceiptCount.ToString("N0"), A(sales.AverageReceipt), changes);
+        var changes = sales.SalesAvailable && sales.ComparisonAvailable
+            ? $"Վաճառք՝ {SignedPlain(sales.SalesChange)}\nՇահույթ՝ {(sales.ProfitAvailable ? SignedPlain(sales.ProfitChange) : "Տվյալ չկա")}\nԿտրոններ՝ {sales.ReceiptChange:+#;-#;0}"
+            : "Համեմատության տվյալները հասանելի չեն";
+        AddRow(grid, sales.SalesDisplay, sales.CostDisplay, sales.ProfitDisplay, sales.ReceiptCount.ToString("N0"), A(sales.AverageReceipt), changes);
         return Card(new StackPanel { Children = { Text("📈 Վաճառքի ամփոփում", 16, FontWeights.SemiBold), Text("Այսօրվա ցուցանիշները՝ նախորդ օրվա համեմատ", 12, null, BrushFor("#64748B")), grid } });
     }
     private static Expander CollapsibleSection(string title, UIElement content) => new()
@@ -690,12 +882,16 @@ public static class Views
     private static Grid NewGrid(params string[] headers)
     {
         var grid = new Grid { Margin = new Thickness(0, 12, 0, 0) }; foreach (var _ in headers) grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); for (var i=0;i<headers.Length;i++) { var t = Text(headers[i], 12, FontWeights.SemiBold, BrushFor("#475569")); Grid.SetColumn(t,i); grid.Children.Add(t); } return grid;
+        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        var band = new Border { Background = BrushFor("#EDF2F9"), CornerRadius = new CornerRadius(6), IsHitTestVisible = false };
+        Grid.SetColumnSpan(band, Math.Max(1,headers.Length)); grid.Children.Add(band);
+        for (var i=0;i<headers.Length;i++) { var t = Text(headers[i], 12, FontWeights.SemiBold, BrushFor("#475569")); t.Margin = new Thickness(7,13,7,13); Grid.SetColumn(t,i); grid.Children.Add(t); } return grid;
     }
     private static void AddRow(Grid grid, params string[] values)
     {
         var row = grid.RowDefinitions.Count; grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        for (var i=0; i<values.Length; i++) { var t = Text(values[i], 13); t.Margin = new Thickness(0,8,5,8); Grid.SetRow(t,row); Grid.SetColumn(t,i); grid.Children.Add(t); }
+        RowSurface(grid,row);
+        for (var i=0; i<values.Length; i++) { var t = Text(values[i], 13); t.Margin = new Thickness(7,12,7,12); Grid.SetRow(t,row); Grid.SetColumn(t,i); grid.Children.Add(t); }
     }
     private static void AddEditableDeliveryRow(Grid grid, SupplierDeliveryPattern pattern, Action<SupplierDeliveryPattern, decimal> saveAmount)
     {
@@ -723,10 +919,22 @@ public static class Views
         };
         return new StackPanel { Orientation = Orientation.Horizontal, Children = { box, button } };
     }
-    private static void AddEditableSupplierWeekRow(Grid grid, SupplierWeekPlanRow row, EmployeeSupplierAction? employeeAction, Action<SupplierWeekPlanRow, decimal, decimal, decimal, decimal> saveRow, Action<string> showSupplierStatus, Action<SupplierWeekPlanRow, EmployeeSupplierAction?> editStatus)
+    private static void AddEditableSupplierWeekRow(Grid grid, SupplierWeekPlanRow row, EmployeeSupplierAction? employeeAction, SupplierNote? latestNote, Action<SupplierWeekPlanRow, decimal, decimal, decimal, decimal> saveRow, Action<string> showSupplierStatus, Action<string> showSupplierDebtHistory, Action<SupplierWeekPlanRow, EmployeeSupplierAction?> editStatus, Action<SupplierWeekPlanRow> addNote, Action<SupplierWeekPlanRow> showAnalysis, List<Func<SupplierRowEdit?>> editors, IDictionary<string, string[]> drafts)
     {
         var gridRow = grid.RowDefinitions.Count; grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         var order = MoneyInput(row.OrderAmount); var payment = MoneyInput(row.PaymentAmount); var oldDebt = MoneyInput(row.OldDebtPayment); var debt = MoneyInput(row.Debt);
+        var draftKey = $"{row.Date:yyyyMMdd}|{row.Supplier}";
+        var inputs = new[] { order, payment, oldDebt, debt };
+        if (drafts.TryGetValue(draftKey, out var pending) && pending.Length == inputs.Length)
+            for (var i = 0; i < inputs.Length; i++) inputs[i].Text = pending[i];
+        foreach (var input in inputs) input.TextChanged += (_, _) => drafts[draftKey] = inputs.Select(x => x.Text).ToArray();
+        editors.Add(() =>
+        {
+            if (TryMoney(order, out var o) && TryMoney(payment, out var p) && TryMoney(oldDebt, out var h) && TryMoney(debt, out var d))
+                return new SupplierRowEdit(row, o, p, h, d);
+            order.Focus();
+            return null;
+        });
         var save = new Button { Content = "Պահպանել", Padding = new Thickness(10, 4, 10, 4), Background = BrushFor("#0F766E"), Foreground = Brushes.White, FontWeight = FontWeights.SemiBold };
         save.Click += (_, _) =>
         {
@@ -742,8 +950,33 @@ public static class Views
             : $"{employeeAction.Status}\n{employeeAction.Description}\nՓոփոխող՝ {employeeAction.ReportedByName}\nԺամանակ՝ {employeeAction.ReportedAt:dd.MM.yyyy HH:mm}\n\nՍեղմեք՝ կարգավիճակը ձեռքով փոխելու համար";
         var statusButton = new Button { Content = status, ToolTip = statusText, Padding = new Thickness(0), BorderThickness = new Thickness(0), Background = Brushes.Transparent, Cursor = System.Windows.Input.Cursors.Hand };
         statusButton.Click += (_, _) => editStatus(row, employeeAction);
-        var cells = new UIElement[] { supplierButton, order, payment, oldDebt, debt, Text(Signed(change), 13, null, change > 0 ? BrushFor("#B91C1C") : change < 0 ? BrushFor("#0F766E") : BrushFor("#475569")), statusButton, save };
-        for (var i = 0; i < cells.Length; i++) { if (cells[i] is FrameworkElement element) element.Margin = new Thickness(0, 8, 5, 8); Grid.SetRow(cells[i], gridRow); Grid.SetColumn(cells[i], i); grid.Children.Add(cells[i]); }
+        var shortNote = latestNote is null
+            ? "＋ Նշում"
+            : $"📌 {latestNote.Text[..Math.Min(latestNote.Text.Length, 24)]}{(latestNote.Text.Length > 24 ? "…" : string.Empty)}";
+        var noteButton = new Button
+        {
+            Content = shortNote,
+            ToolTip = latestNote is null ? "Նշում ավելացնել" : $"{latestNote.Text}\n{latestNote.Author} · {latestNote.CreatedAt:dd.MM.yyyy HH:mm}",
+            Padding = new Thickness(7, 3, 7, 3),
+            Background = latestNote is null ? Brushes.Transparent : BrushFor("#E0F2FE"),
+            BorderBrush = latestNote is null ? BrushFor("#94A3B8") : BrushFor("#7DD3FC")
+        };
+        noteButton.Click += (_, _) => addNote(row);
+        var analysis = new Button { Content = "Քարտ", ToolTip = "Բացել ստացման, վճարումների և վաճառքի վերլուծությունը", Padding = new Thickness(8, 3, 8, 3) };
+        analysis.Click += (_, _) => showAnalysis(row);
+        var debtHistory = new Button { Content = "Պատմ.", ToolTip = "Ցույց տալ պարտքի փոփոխությունների պատմությունը", Padding = new Thickness(8, 3, 8, 3) };
+        debtHistory.Click += (_, _) => showSupplierDebtHistory(row.Supplier);
+        supplierButton.Content = Text(row.Supplier, 13, FontWeights.SemiBold, BrushFor("#243B63"));
+        supplierButton.HorizontalContentAlignment = HorizontalAlignment.Left;
+        supplierButton.MaxWidth = 180;
+        var debtCell = new StackPanel(); debtCell.Children.Add(debt);
+        debtCell.Children.Add(Text(Signed(change), 10, null, change > 0 ? BrushFor("#B91C1C") : change < 0 ? BrushFor("#0F766E") : BrushFor("#475569")));
+        var actions = new WrapPanel(); actions.Children.Add(analysis); actions.Children.Add(debtHistory); actions.Children.Add(save);
+        analysis.Margin = debtHistory.Margin = new Thickness(0,0,4,3);
+        noteButton.MaxWidth = 150;
+        RowSurface(grid,gridRow);
+        var cells = new UIElement[] { supplierButton, order, payment, oldDebt, debtCell, statusButton, noteButton, actions };
+        for (var i = 0; i < cells.Length; i++) { if (cells[i] is FrameworkElement element) { element.Margin = new Thickness(6,10,6,10); element.VerticalAlignment = VerticalAlignment.Center; } Grid.SetRow(cells[i], gridRow); Grid.SetColumn(cells[i], i); grid.Children.Add(cells[i]); }
     }
     private static UIElement EmployeeStatusBadge(EmployeeSupplierAction? action)
     {
@@ -755,7 +988,7 @@ public static class Views
             "Չի եկել" => ("✕ Չի եկել", "#FEE2E2", "#B91C1C"),
             "Մենեջերը չի եկել / պատվերը չի գրվել" => ("✕ Չի պատվիրվել", "#FEE2E2", "#B91C1C"),
             "Խնդիր" => ("⚠ Խնդիր կա", "#FEF3C7", "#92400E"),
-            _ => ("Սպասվում է", "#F1F5F9", "#475569")
+            _ => ("● Սպասվում է", "#FFF6DF", "#98670C")
         };
         return new Border
         {
@@ -863,7 +1096,7 @@ public static class Views
         var cells = new UIElement[] { Text(payment.Category), Text(payment.Name), Text(A(payment.Amount)), Text($"Ամսվա {payment.PaymentDay}-ին"), Text(RequiredPaymentRules.ScopeLabel(payment)), Text(string.IsNullOrWhiteSpace(payment.Note) ? "—" : payment.Note), actions };
         for (var i = 0; i < cells.Length; i++) { if (cells[i] is FrameworkElement element) element.Margin = new Thickness(0, 8, 5, 8); Grid.SetRow(cells[i], row); Grid.SetColumn(cells[i], i); grid.Children.Add(cells[i]); }
     }
-    private static TextBox MoneyInput(decimal value) => new() { Text = value.ToString("0"), Width = 90, VerticalContentAlignment = VerticalAlignment.Center };
+    private static TextBox MoneyInput(decimal value) => new() { Text = value.ToString("0"), Width = 90, Height = 34, Padding = new Thickness(7,4,7,4), TextAlignment = TextAlignment.Right, VerticalContentAlignment = VerticalAlignment.Center };
     private static bool TryMoney(TextBox box, out decimal amount) => decimal.TryParse(box.Text.Replace(" ", ""), out amount) && amount >= 0;
     private static string Icon(Severity s) => s switch { Severity.Critical => "🔴", Severity.Warning => "🟡", _ => "🟢" };
     private static Brush BrushFor(string hex) => new SolidColorBrush((System.Windows.Media.Color)ColorConverter.ConvertFromString(hex));

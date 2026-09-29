@@ -33,7 +33,7 @@ public sealed record BankSalesBreakdown(decimal BankReport, decimal AmeriabankPo
     public static readonly BankSalesBreakdown Empty = new(0m, 0m, 0m);
 }
 
-public sealed record CashDeskAdjustment(DateOnly Date, string CashDesk, decimal ClosingBalance, string Note);
+public sealed record CashDeskAdjustment(DateOnly Date, string CashDesk, decimal ClosingBalance, string Note, DateTime? ChangedAt = null);
 
 public sealed record CashLedgerMovement(
     DateOnly Date,
@@ -44,6 +44,20 @@ public sealed record CashLedgerMovement(
     string Partner,
     string ContractOrReason,
     bool IsInternalTransfer);
+
+/// <summary>
+/// A payment or cash withdrawal entered by the owner.  The source is always
+/// explicit: bank, 0001 or 0002.  A bank withdrawal has a target cash desk.
+/// </summary>
+public sealed record FundsTransaction(
+    Guid Id,
+    DateOnly Date,
+    string Source,
+    decimal Amount,
+    string Purpose,
+    string Category,
+    string? TargetCashDesk,
+    DateTime RecordedAt);
 
 public sealed record Supplier(string Name, string Direction, decimal Debt, DateOnly NextSupplyDate,
     int PriorityScore, string PaymentMode, string Note);
@@ -81,9 +95,17 @@ public sealed record SalesSummary(
     int ReceiptCount,
     decimal PreviousSalesAmount,
     decimal PreviousProfitAmount,
-    int PreviousReceiptCount)
+    int PreviousReceiptCount,
+    bool SalesAvailable = true,
+    bool CostAvailable = true,
+    bool ComparisonAvailable = true,
+    string? DataWarning = null)
 {
     public decimal Profit => SalesAmount - CostAmount;
+    public bool ProfitAvailable => SalesAvailable && CostAvailable;
+    public string SalesDisplay => SalesAvailable ? $"{SalesAmount:N0} ֏" : "Տվյալ չկա";
+    public string CostDisplay => CostAvailable ? $"{CostAmount:N0} ֏" : "Տվյալ չկա";
+    public string ProfitDisplay => ProfitAvailable ? $"{Profit:N0} ֏" : "Չի հաշվարկվել";
     public decimal AverageReceipt => ReceiptCount == 0 ? 0m : SalesAmount / ReceiptCount;
     public decimal SalesChange => SalesAmount - PreviousSalesAmount;
     public decimal ProfitChange => Profit - PreviousProfitAmount;
@@ -145,10 +167,34 @@ public sealed record SupplierSalesAnalysis(
     decimal CostAmount,
     decimal Quantity,
     int ProductCount,
-    int StorageCount)
+    int StorageCount,
+    bool CostAvailable = true)
 {
     public decimal Profit => SalesAmount - CostAmount;
+    public string CostDisplay => CostAvailable ? $"{CostAmount:N0} ֏" : "Տվյալ չկա";
+    public string ProfitDisplay => CostAvailable ? $"{Profit:N0} ֏" : "Չի հաշվարկվել";
 }
+
+/// <summary>Actual supplier receipts and payments, grouped by calendar day.</summary>
+public sealed record SupplierActivityLine(
+    DateOnly Date,
+    decimal ReceiptAmount,
+    decimal PaymentForOrder,
+    decimal OldDebtPayment,
+    string DocumentNumbers,
+    string Description);
+
+public sealed record SupplierAnalysisData(
+    string Supplier,
+    DateOnly StartDate,
+    DateOnly EndDate,
+    decimal CurrentDebt,
+    IReadOnlyList<SupplierActivityLine> Activity,
+    SupplierSalesAnalysis? Sales,
+    bool FromHts,
+    string? Warning = null);
+
+public sealed record SupplierRowEdit(SupplierWeekPlanRow Row, decimal Order, decimal Payment, decimal OldDebtPayment, decimal Debt);
 
 public sealed class DashboardSnapshot
 {

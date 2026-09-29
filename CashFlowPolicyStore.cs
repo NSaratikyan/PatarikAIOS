@@ -10,7 +10,9 @@ namespace PatarikAIOS;
 public sealed record CashFlowPolicy(
     decimal MinimumReserve,
     List<string> NonMovableSuppliers,
-    List<string> NonMovablePaymentCategories)
+    List<string> NonMovablePaymentCategories,
+    decimal? WeeklySalesBaselineOverride = null,
+    FixedCostAllocationMode FixedCostAllocation = FixedCostAllocationMode.ByDueDate)
 {
     public static CashFlowPolicy Default => new(
         MinimumReserve: 25_000m,
@@ -19,7 +21,19 @@ public sealed record CashFlowPolicy(
             "Տոբակ", "Նեվիս", "Վինկո", "Ֆիլիպ Մորիս",
             "Մարիաննա", "Ալյուր"
         ],
-        NonMovablePaymentCategories: ["Կոմունալ", "Վարձավճար"]);
+        NonMovablePaymentCategories: ["Կոմունալ", "Վարձավճար"],
+        WeeklySalesBaselineOverride: null,
+        FixedCostAllocation: FixedCostAllocationMode.ByDueDate);
+}
+
+/// <summary>
+/// This affects the planning reserve only.  Actual cash is still deducted on
+/// the real payment day, so a reserve is never recorded as a second payment.
+/// </summary>
+public enum FixedCostAllocationMode
+{
+    ByDueDate,
+    EvenlyAcrossMonth
 }
 
 public sealed class CashFlowPolicyStore
@@ -40,7 +54,8 @@ public sealed class CashFlowPolicyStore
                     return policy with
                     {
                         NonMovableSuppliers = policy.NonMovableSuppliers ?? [],
-                        NonMovablePaymentCategories = policy.NonMovablePaymentCategories ?? []
+                        NonMovablePaymentCategories = policy.NonMovablePaymentCategories ?? [],
+                        FixedCostAllocation = policy.FixedCostAllocation
                     };
             }
         }

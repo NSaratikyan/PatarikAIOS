@@ -26,6 +26,11 @@ public static class DecisionEngine
         }).OrderByDescending(x => x.PriorityScore).ThenByDescending(x => x.Debt).ToList();
 
         var recommendations = new List<AiRecommendation>();
+        if (!source.Sales.SalesAvailable || !string.IsNullOrWhiteSpace(source.Sales.DataWarning))
+            recommendations.Add(new("Տվյալները մասնակի են", Severity.Warning,
+                source.Sales.DataWarning ?? "Վաճառքի տվյալները հասանելի չեն։",
+                "Ստուգել ՀԾ կապն ու հաշվետվությունների իրավունքները՝ մինչև թվերի հիման վրա որոշում ընդունելը։",
+                "Բացակայող տվյալները զրոյական փաստացի վաճառք չեն համարվում։", false));
         if (plannedOutflow > 0m && projectedBalance < 0m)
             recommendations.Add(new("Դրամական բացի ռիսկ", Severity.Critical,
                 $"Այսօրվա պլանավորված վճարումները՝ {plannedOutflow:N0} ֏, գերազանցում են հասանելի {source.Cash.Available:N0} ֏ միջոցները։",
@@ -44,7 +49,7 @@ public static class DecisionEngine
                 "Վճարման վերջնական չափը հաստատելուց առաջ ստուգել մատակարարման պայմանավորվածությունը և պարտքի ժամկետը։",
                 "Գնահատականը կազմվել է պարտքի չափից, մոտակա մատակարարումից և բաց պարտքի առկայությունից։"));
 
-        if (source.Sales.PreviousSalesAmount > 0m && source.Sales.SalesChange <= -source.Sales.PreviousSalesAmount * 0.15m)
+        if (source.Sales.SalesAvailable && source.Sales.ComparisonAvailable && source.Sales.PreviousSalesAmount > 0m && source.Sales.SalesChange <= -source.Sales.PreviousSalesAmount * 0.15m)
             recommendations.Add(new("Վաճառքի նկատելի անկում", Severity.Warning,
                 $"Վաճառքը նվազել է {Math.Abs(source.Sales.SalesChange):N0} ֏ ({Math.Abs(source.Sales.SalesChange / source.Sales.PreviousSalesAmount * 100m):0.#}%) նախորդ օրվա համեմատ։",
                 "Վերանայել վաճառքի ժամերը, մնացորդները և առաջիկա պատվերների ծավալը։",

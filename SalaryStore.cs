@@ -7,7 +7,7 @@ namespace PatarikAIOS;
 public sealed record SalaryAccrual(Guid Id, DateOnly Date, string Employee, decimal Amount, string Note, DateTime CreatedAt);
 
 /// <summary>A salary payment made to an employee for a specified work week.</summary>
-public sealed record SalaryPayment(Guid Id, DateOnly WeekStart, string Employee, decimal Amount, DateOnly PaidDate, string Note);
+public sealed record SalaryPayment(Guid Id, DateOnly WeekStart, string Employee, decimal Amount, DateOnly PaidDate, string Note, string? CashSource = null);
 
 public sealed class SalaryStore
 {
@@ -20,6 +20,14 @@ public sealed class SalaryStore
     public List<SalaryPayment> LoadPayments() => Load<SalaryPayment>(PaymentPath);
     public void SaveAccruals(IEnumerable<SalaryAccrual> rows) => Save(AccrualPath, rows);
     public void SavePayments(IEnumerable<SalaryPayment> rows) => Save(PaymentPath, rows);
+    public void SaveCorrection(IEnumerable<SalaryAccrual> accruals, IEnumerable<SalaryPayment> payments)
+    {
+        var oldAccruals=LoadAccruals(); var oldPayments=LoadPayments();
+        var archive=Path.Combine(_directory,"salary-corrections",DateTime.Now.ToString("yyyyMMdd-HHmmss-fffffff")+".json");
+        AtomicJsonFile.Save(archive,new { At=DateTime.Now, Accruals=oldAccruals, Payments=oldPayments });
+        try { AtomicJsonFile.Save(AccrualPath,accruals.ToList()); AtomicJsonFile.Save(PaymentPath,payments.ToList()); }
+        catch { AtomicJsonFile.Save(AccrualPath,oldAccruals); AtomicJsonFile.Save(PaymentPath,oldPayments); throw; }
+    }
 
     private static List<T> Load<T>(string path)
     {

@@ -67,8 +67,7 @@ public sealed class LocalSupplierWeekPlanStore
     }
     public void Save(IEnumerable<SupplierWeekPlanRow> rows)
     {
-        Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
-        File.WriteAllText(_path, JsonSerializer.Serialize(rows, new JsonSerializerOptions { WriteIndented = true }));
+        AtomicJsonFile.Save(_path, rows.ToList());
     }
 }
 

@@ -10,12 +10,12 @@ public sealed class CashDeskAdjustmentWindow : Window
     private readonly TextBox _note;
     public CashDeskAdjustment? Result { get; private set; }
 
-    public CashDeskAdjustmentWindow(DateOnly selectedDate)
+    public CashDeskAdjustmentWindow(DateOnly selectedDate, IEnumerable<CashDeskAdjustment>? history = null)
     {
-        Title = "Դրամարկղի մնացորդի ուղղում";
-        Width = 480; Height = 370; ResizeMode = ResizeMode.NoResize;
+        Title = "Դրամարկղի / բանկի մնացորդի ուղղում";
+        Width = 620; Height = 650;
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
-        _cashDesk = new ComboBox { ItemsSource = new[] { "0001 — Դրամարկղ", "0002 — Պահոց" }, SelectedIndex = 0 };
+        _cashDesk = new ComboBox { ItemsSource = new[] { "0001 — Դրամարկղ", "0002 — Պահոց", "bank — Ընդհանուր բանկային մնացորդ" }, SelectedIndex = 0 };
         _date = new DatePicker { SelectedDate = selectedDate.ToDateTime(TimeOnly.MinValue) };
         _amount = new TextBox();
         _note = new TextBox { Height = 74, TextWrapping = TextWrapping.Wrap, AcceptsReturn = true };
@@ -30,7 +30,11 @@ public sealed class CashDeskAdjustmentWindow : Window
         save.Click += Save_Click;
         var cancel = new Button { Content = "Չեղարկել", IsCancel = true }; cancel.Click += (_, _) => Close();
         var actions = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 18, 0, 0) };
-        actions.Children.Add(cancel); actions.Children.Add(save); panel.Children.Add(actions); Content = panel;
+        actions.Children.Add(cancel); actions.Children.Add(save); panel.Children.Add(actions);
+        panel.Children.Add(Label("Ուղղումների պատմություն (վերջին 30-ը)"));
+        foreach (var entry in (history ?? []).Reverse().Take(30))
+            panel.Children.Add(new TextBlock { Text = $"{entry.Date:dd.MM.yyyy} · {entry.CashDesk} · {entry.ClosingBalance:N2} ֏\n{entry.Note} · {entry.ChangedAt:dd.MM.yyyy HH:mm}", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 6, 0, 6) });
+        Content = new ScrollViewer { Content = panel, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
     }
 
     private static TextBlock Label(string text) => new() { Text = text, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 8, 0, 3) };
@@ -40,7 +44,8 @@ public sealed class CashDeskAdjustmentWindow : Window
         {
             MessageBox.Show("Նշեք ամսաթիվ և գումար։", "Սխալ տվյալ", MessageBoxButton.OK, MessageBoxImage.Warning); return;
         }
-        Result = new CashDeskAdjustment(DateOnly.FromDateTime(_date.SelectedDate.Value), (_cashDesk.SelectedItem as string ?? "0001")[..4], amount, _note.Text.Trim());
+        if (string.IsNullOrWhiteSpace(_note.Text)) { MessageBox.Show("Նշեք ուղղման պատճառը։"); return; }
+        Result = new CashDeskAdjustment(DateOnly.FromDateTime(_date.SelectedDate.Value), (_cashDesk.SelectedItem as string ?? "0001")[..4], amount, _note.Text.Trim(), DateTime.Now);
         DialogResult = true;
     }
 }
